@@ -8544,7 +8544,7 @@ mod tests {
 
     #[test]
     fn an_image_goes_where_it_is_sent_once_swiped() {
-        let (f, i) = (fonts(), info());
+        let (f, i) = (fonts(), DeviceInfo { slot: Some(Slot::A), ..info() });
         let mut app = sideloading(&f, &i);
         app.install(Event::Checking { size: 201_326_592 }, 0);
         let kind = ImageKind::Boot { kernel: true, ramdisk: skyward_install::Ramdisk::Recovery };
@@ -8573,8 +8573,7 @@ mod tests {
 
     #[test]
     fn a_phone_without_slots_hides_slot_choice_and_formats_single_partition_outcomes() {
-        let (f, mut i) = (fonts(), info());
-        i.slot = None;
+        let (f, i) = (fonts(), DeviceInfo { slot: None, ..info() });
         let mut app = sideloading(&f, &i);
         app.state.wlan = Some(connected("Skyward"));
         app.state.recovery_partitions = true;
@@ -8591,10 +8590,17 @@ mod tests {
         app.install(Event::Reflashed(Reflash::Written(vec![])), 1000);
         app.install(Event::Finished(Outcome::Flashed { partition: "recovery", slots: vec![] }), 1000);
         let _ = app.frame(&f, &i);
-        app.skyward_ended(SkywardEnd::Updated(vec![]), 2000);
-        let _ = app.frame(&f, &i);
-        app.skyward_ended(SkywardEnd::WriteFailed(vec![], "io".into()), 3000);
-        let _ = app.frame(&f, &i);
+
+        let mut update = App::new(Screen::SkywardUpdate, W, H, PPD);
+        update.state.wlan = Some(connected("Skyward"));
+        update.state.recovery_partitions = true;
+        update.skyward_checked(Ok(skyward_newest(true)));
+        assert!(matches!(tap(&mut update, &f, &i, Action::UpdateSkyward).as_slice(), [Effect::UpdateSkyward(_)]));
+        update.skyward_ended(SkywardEnd::WriteFailed(vec![], "io".into()), 2000);
+        let _ = update.frame(&f, &i);
+        assert!(matches!(tap_at(&mut update, &f, &i, Action::UpdateSkyward, 4000).as_slice(), [Effect::UpdateSkyward(_)]));
+        update.skyward_ended(SkywardEnd::Updated(vec![]), 5000);
+        let _ = update.frame(&f, &i);
     }
 
     #[test]
