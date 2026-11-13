@@ -625,7 +625,7 @@ service keepme /system/bin/servicemanager
 ";
         rd.add("system/etc/init/hw/init.rc", 0o644, rc.as_bytes().to_vec()).unwrap();
         let cfg = skyward_config::DeviceConfig::parse(include_str!("../../../devices/pchm30.toml")).unwrap();
-        disable_init_services(&mut rd, &cfg.services, &cfg.stock.as_ref().map_or(&[][..], |s| s.disable_services.as_slice())).unwrap();
+        disable_init_services(&mut rd, &cfg.services, cfg.stock.as_ref().map_or(&[][..], |s| s.disable_services.as_slice())).unwrap();
         let patched = String::from_utf8(rd.find("system/etc/init/hw/init.rc").unwrap().data.clone()).unwrap();
         assert!(patched.contains("    # disabled by skyward: start hal_cryptoeng_oppo"));
         assert!(patched.contains("service hwservicemanager /system/bin/hwservicemanager\n    disabled\n    onrestart"));
