@@ -672,13 +672,12 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
         }
         skyward_sys::kmsg(&format!("{name} is the installed system's {value}"))?;
     }
-    for name in ["ro.vndk.version"] {
-        if let Some(value) = props.get(name) {
-            if skyward_sys::prop(name).is_none() {
-                skyward_sys::set_prop(name, value)?;
-            }
-            skyward_sys::kmsg(&format!("{name} is the installed system's {value}"))?;
+    let name = "ro.vndk.version";
+    if let Some(value) = props.get(name) {
+        if skyward_sys::prop(name).is_none() {
+            skyward_sys::set_prop(name, value)?;
         }
+        skyward_sys::kmsg(&format!("{name} is the installed system's {value}"))?;
     }
     Ok(())
 }
