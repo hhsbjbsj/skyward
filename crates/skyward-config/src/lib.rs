@@ -34,6 +34,7 @@ pub mod ramdisk {
     pub const TASK_PROFILES: &str = "system/etc/task_profiles.json";
     /// The init rules that set up file transfer's USB function.
     pub const MTP_RC: &str = "system/etc/init/skyward-mtp.rc";
+    pub const STOCK_RC: &str = "system/etc/init/skyward-stock.rc";
 
     /// Whether the running root is Skyward's recovery ramdisk.
     pub fn in_recovery() -> bool {
@@ -114,6 +115,19 @@ pub struct Stock {
     /// by Skyward that can be pruned before repacking.
     #[serde(default)]
     pub prune: Vec<String>,
+    /// USB device controller name (`sys.usb.controller`, e.g. `a600000.dwc3`)
+    /// to set at init and put in peripheral mode when the bootloader omits
+    /// `androidboot.usbcontroller`.
+    #[serde(default)]
+    pub usb_controller: Option<String>,
+    /// Target path symlinked at `/dev/block/bootdevice` (e.g. `/dev/block`)
+    /// when the bootloader omits `androidboot.bootdevice`.
+    #[serde(default)]
+    pub bootdevice: Option<String>,
+    /// Additional stock init service executable paths to mark `disabled` and
+    /// stop explicit `start` rules for beyond `[service]` / `[[service]]`.
+    #[serde(default)]
+    pub disable_services: Vec<String>,
 }
 
 /// What brings the phone's WLAN up inside a recovery, which loads none of
@@ -621,6 +635,24 @@ impl DeviceConfig {
                     "[stock] prune: {path} is not a relative ramdisk path"
                 );
             }
+            if let Some(ctrl) = &stock.usb_controller {
+                ensure!(
+                    !ctrl.is_empty() && !ctrl.contains('/') && !ctrl.chars().any(char::is_whitespace),
+                    "[stock] usb_controller: {ctrl:?} is not a UDC controller name"
+                );
+            }
+            if let Some(dev) = &stock.bootdevice {
+                ensure!(
+                    dev.starts_with('/') && !dev.chars().any(char::is_whitespace),
+                    "[stock] bootdevice: {dev:?} is not an absolute device path"
+                );
+            }
+            for path in &stock.disable_services {
+                ensure!(
+                    path.starts_with('/') && !path.chars().any(char::is_whitespace),
+                    "[stock] disable_services: {path:?} is not an absolute binary path"
+                );
+            }
         }
         if let Some(wlan) = &cfg.wlan {
             ensure!(wlan.probe.starts_with("http://"), "[wlan] probe: {} is not a plain HTTP address", wlan.probe);
@@ -907,9 +939,15 @@ mod tests {
         assert!(DeviceConfig::parse(&format!("{other}recovery = \"{hash}\"\n")).is_err(), "the package of another build");
         let raw = format!("[device]\ncodename = \"x\"\n[stock]\nversion = \"V1\"\npackage = \"https://d.example/recovery.img.gz\"\nrecovery = \"{hash}\"\n");
         assert!(DeviceConfig::parse(&raw).is_ok());
-        assert!(DeviceConfig::parse(&format!("{raw}ramdisk_compression = \"lzma\"\nprune = [\"res/ColorOS/ttf\"]\n")).is_ok());
+        assert!(DeviceConfig::parse(&format!(
+            "{raw}ramdisk_compression = \"lzma\"\nprune = [\"res/ColorOS/ttf\"]\nusb_controller = \"a600000.dwc3\"\nbootdevice = \"/dev/block\"\ndisable_services = [\"/system/bin/gatekeeperd\"]\n"
+        ))
+        .is_ok());
         assert!(DeviceConfig::parse(&format!("{raw}prune = [\"/res\"]\n")).is_err(), "absolute prune path");
         assert!(DeviceConfig::parse(&format!("{raw}prune = [\"../etc\"]\n")).is_err(), "parent traversal in prune path");
+        assert!(DeviceConfig::parse(&format!("{raw}usb_controller = \"a/b\"\n")).is_err(), "usb controller with slash");
+        assert!(DeviceConfig::parse(&format!("{raw}bootdevice = \"dev/block\"\n")).is_err(), "relative bootdevice path");
+        assert!(DeviceConfig::parse(&format!("{raw}disable_services = [\"gatekeeperd\"]\n")).is_err(), "relative service path");
         assert_eq!(DeviceConfig::parse("[device]\ncodename = \"x\"\n").unwrap().stock, None);
     }
 
@@ -1108,5 +1146,8 @@ mod tests {
         assert!(stock.package.ends_with(".img.gz"));
         assert_eq!(stock.ramdisk_compression, Some(RamdiskCompression::Lzma));
         assert_eq!(stock.prune, ["res/ColorOS/ttf", "res/realmeUI/ttf"]);
+        assert_eq!(stock.usb_controller.as_deref(), Some("a600000.dwc3"));
+        assert_eq!(stock.bootdevice.as_deref(), Some("/dev/block"));
+        assert!(stock.disable_services.iter().any(|s| s == "/system/bin/gatekeeperd"));
     }
 }

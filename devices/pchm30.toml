@@ -84,3 +84,19 @@ recovery = "bcbfddea46590482ed533cb3438baaadd9201eaa35855b35fa871532ef6d3cc7"
 # Skyward replaces system/bin/recovery.
 ramdisk_compression = "lzma"
 prune = ["res/ColorOS/ttf", "res/realmeUI/ttf"]
+# PCHM30's bootloader omits androidboot.usbcontroller and androidboot.bootdevice
+# from the kernel command line; expose the DWC3 controller and block symlink
+# explicitly so adb and MTP come up and /dev/block/bootdevice resolves.
+usb_controller = "a600000.dwc3"
+bootdevice = "/dev/block"
+# Stock recovery init.rc starts legacy crypto/gatekeeper/network/watchdog
+# daemons that conflict with Skyward's supervised HALs or crash-loop at boot.
+disable_services = [
+    "/system/bin/qseecomd",
+    "/system/bin/android.hardware.keymaster@4.0-service-qti",
+    "/system/bin/hw/vendor.oplus.hardware.cryptoeng@1.0-service",
+    "/system/bin/gatekeeperd",
+    "/vendor/bin/vndservicemanager",
+    "/system/bin/wpa_supplicant",
+    "/system/bin/phoenix_recovery",
+]

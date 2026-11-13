@@ -243,10 +243,21 @@ pub fn installed_props(slot: Option<Slot>) -> Result<HashMap<String, String>> {
     }
     let runtime = Path::new("/cache/runtime.prop");
     if runtime.try_exists().unwrap_or(false) {
-        rsproperties::load_properties_from_file(runtime, None, "u:r:init:s0", &mut props)
-            .with_context(|| format!("read {}", runtime.display()))?;
+        merge_fallback_props(runtime, &mut props)?;
     }
     Ok(props)
+}
+
+/// Merge fallback properties from `path` into `props` without overwriting
+/// values already collected from mounted system/vendor partitions.
+fn merge_fallback_props(path: &Path, props: &mut HashMap<String, String>) -> Result<()> {
+    let mut extra = HashMap::new();
+    rsproperties::load_properties_from_file(path, None, "u:r:init:s0", &mut extra)
+        .with_context(|| format!("read {}", path.display()))?;
+    for (k, v) in extra {
+        props.entry(k).or_insert(v);
+    }
+    Ok(())
 }
 
 fn read(path: impl AsRef<Path>) -> Result<String> {
@@ -518,5 +529,16 @@ mod tests {
         assert!(!said_online(Err(Error::from(ErrorKind::WouldBlock))).unwrap(), "Qualcomm's USB-C connector early in a boot");
         assert!(!said_online(Err(Error::from(ErrorKind::NotFound))).unwrap(), "a supply without the file");
         assert!(said_online(Err(Error::from(ErrorKind::PermissionDenied))).is_err(), "anything else is an error");
+    }
+
+    #[test]
+    fn cache_runtime_props_never_overwrite_partition_props() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime.prop");
+        fs::write(&runtime, "ro.build.version.release=11\nro.oppo.version=CN\n").unwrap();
+        let mut props = HashMap::from([("ro.build.version.release".into(), "16".into())]);
+        merge_fallback_props(&runtime, &mut props).unwrap();
+        assert_eq!(props.get("ro.build.version.release").map(String::as_str), Some("16"));
+        assert_eq!(props.get("ro.oppo.version").map(String::as_str), Some("CN"));
     }
 }

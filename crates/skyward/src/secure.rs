@@ -64,6 +64,7 @@ const HARDWARE_DRIVER_NODE: &str = "/dev/binderfs/hwbinder";
 /// The directory for those services is itself one of them, and it turns
 /// itself off when the running system does not describe it.
 const HARDWARE_DIRECTORY: &str = "android.hidl.manager@1.2::IServiceManager/default";
+const HARDWARE_TOKEN_MANAGER: &str = "android.hidl.token@1.0::ITokenManager/default";
 
 /// The name init gives the older hardware service directory and the
 /// property it sets once answering, on recoveries whose init starts one
@@ -89,27 +90,29 @@ const RECOVERY_MANIFEST: &str = "/system/etc/vintf/manifest.xml";
 /// filesystem, does not have.
 ///
 /// `wanted` names the hardware services that will be asked for.
-pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
+pub fn prepare_hardware_directory(wanted: &[String], directory_from_system: bool) -> Result<()> {
     // A loader and the lowest libraries are built together and agree
     // between them on how a program's own storage is laid out, so the
     // installed system's programs are loaded by the installed system's
     // loader rather than by the older one a recovery carries.
-    let loader = Path::new(EARLY_LOADER);
-    let from = bundle(RUNTIME_BUNDLE)?
-        .map(|at| at.join(BUNDLE_LOADER))
-        .filter(|p| p.is_file())
-        .with_context(|| format!("the installed system carries no {RUNTIME_BUNDLE}, which holds the loader its own programs ask for"))?;
-    let dir = loader.parent().expect("the loader is in a directory");
-    fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
-    // Made under the recovery's own umask the folder is root's alone, and
-    // the programs that ask for this loader run as the users their init
-    // scripts name: as the system's own folder is, it is open to all.
-    fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .with_context(|| format!("open {} to every user", dir.display()))?;
-    if loader.exists() {
-        fs::remove_file(loader).with_context(|| format!("take away {}", loader.display()))?;
+    if directory_from_system {
+        let loader = Path::new(EARLY_LOADER);
+        let from = bundle(RUNTIME_BUNDLE)?
+            .map(|at| at.join(BUNDLE_LOADER))
+            .filter(|p| p.is_file())
+            .with_context(|| format!("the installed system carries no {RUNTIME_BUNDLE}, which holds the loader its own programs ask for"))?;
+        let dir = loader.parent().expect("the loader is in a directory");
+        fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
+        // Made under the recovery's own umask the folder is root's alone, and
+        // the programs that ask for this loader run as the users their init
+        // scripts name: as the system's own folder is, it is open to all.
+        fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .with_context(|| format!("open {} to every user", dir.display()))?;
+        if loader.exists() {
+            fs::remove_file(loader).with_context(|| format!("take away {}", loader.display()))?;
+        }
+        std::os::unix::fs::symlink(&from, loader).with_context(|| format!("point {} at {}", loader.display(), from.display()))?;
     }
-    std::os::unix::fs::symlink(&from, loader).with_context(|| format!("point {} at {}", loader.display(), from.display()))?;
     let driver = Path::new(HARDWARE_DRIVER);
     if !driver.exists() {
         std::os::unix::fs::symlink(HARDWARE_DRIVER_NODE, driver)
@@ -129,7 +132,9 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     // are given the modes the system's own copies have.
     fs::set_permissions(RECOVERY_LABELS, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .with_context(|| format!("open {RECOVERY_LABELS} to every user"))?;
-    fs::copy(from, &into).with_context(|| format!("copy {} to {}", from.display(), into.display()))?;
+    if directory_from_system || !into.exists() {
+        fs::copy(from, &into).with_context(|| format!("copy {} to {}", from.display(), into.display()))?;
+    }
     fs::write(RECOVERY_MANIFEST, describe_hardware(wanted)?).with_context(|| format!("write {RECOVERY_MANIFEST}"))?;
     fs::set_permissions(RECOVERY_MANIFEST, std::os::unix::fs::PermissionsExt::from_mode(0o644))
         .with_context(|| format!("let every user read {RECOVERY_MANIFEST}"))?;
@@ -156,7 +161,7 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
 /// holds the two.
 fn describe_hardware(wanted: &[String]) -> Result<String> {
     let mut out = String::from("<manifest version=\"1.0\" type=\"framework\">\n");
-    for name in std::iter::once(HARDWARE_DIRECTORY).chain(wanted.iter().map(String::as_str)) {
+    for name in [HARDWARE_DIRECTORY, HARDWARE_TOKEN_MANAGER].into_iter().chain(wanted.iter().map(String::as_str)) {
         let (package, rest) = name
             .split_once('@')
             .with_context(|| format!("{name} does not read as a hardware service's name"))?;

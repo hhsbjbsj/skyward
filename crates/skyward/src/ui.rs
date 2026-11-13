@@ -293,14 +293,29 @@ fn plug(app: &mut App, was: &Option<skyward_info::Battery>, is: &Option<skyward_
 
 /// How far a computer has the USB port, as the port's controller tells.
 fn usb_link() -> Result<UsbLink> {
-    let controller = skyward_sys::prop("sys.usb.controller").context("init names no USB controller")?;
-    let path = Path::new("/sys/class/udc").join(controller).join("state");
-    let state = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    Ok(match state.trim() {
+    let controller = skyward_sys::prop("sys.usb.controller").filter(|c| !c.is_empty());
+    Ok(udc_state(Path::new("/sys/class/udc"), controller.as_deref()))
+}
+
+/// Read the UDC link state from `controller` under `udc_root`, falling back to
+/// the first present UDC entry if `init` did not publish `sys.usb.controller`,
+/// and treating an absent UDC as unplugged rather than failing the UI loop.
+fn udc_state(udc_root: &Path, controller: Option<&str>) -> UsbLink {
+    let candidate = controller.map(|c| udc_root.join(c).join("state")).or_else(|| {
+        fs::read_dir(udc_root)
+            .ok()?
+            .flatten()
+            .map(|e| e.path().join("state"))
+            .find(|p| p.exists())
+    });
+    let Some(state) = candidate.and_then(|p| fs::read_to_string(p).ok()) else {
+        return UsbLink::Unplugged;
+    };
+    match state.trim() {
         "configured" => UsbLink::Connected,
         "not attached" => UsbLink::Unplugged,
         _ => UsbLink::Connecting,
-    })
+    }
 }
 
 /// What a request from misc shows on the pages that answer it.
