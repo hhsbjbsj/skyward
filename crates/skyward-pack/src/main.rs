@@ -528,6 +528,6 @@ service keepme /system/bin/servicemanager
         assert!(patched.contains("service hwservicemanager /system/bin/hwservicemanager\n    disabled\n    onrestart"));
         assert!(patched.contains("--lazy\n    disabled\n    seclabel u:r:recovery:s0"));
         assert_eq!(patched.matches("disabled").count(), 3);
-        assert!(!patched.contains("servicemanager\n    disabled"));
+        assert!(!patched.contains("/system/bin/servicemanager\n    disabled"));
     }
 }
