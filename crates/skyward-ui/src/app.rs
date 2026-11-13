@@ -8572,6 +8572,32 @@ mod tests {
     }
 
     #[test]
+    fn a_phone_without_slots_hides_slot_choice_and_formats_single_partition_outcomes() {
+        let (f, mut i) = (fonts(), info());
+        i.slot = None;
+        let mut app = sideloading(&f, &i);
+        app.state.wlan = Some(connected("Skyward"));
+        app.state.recovery_partitions = true;
+        app.install(Event::Checking { size: 67_108_864 }, 0);
+        let kind = ImageKind::Boot { kernel: true, ramdisk: skyward_install::Ramdisk::Recovery };
+        app.install(Event::Image { kind, size: 67_108_864, partitions: vec!["recovery"] }, 0);
+        let frame = app.frame(&f, &i);
+        assert!(!frame.hits.iter().any(|h| matches!(h.action, Action::FlashSlots(_))), "slot picker stays hidden");
+        let track = frame.hits.iter().find(|h| h.action == Action::Confirm(Confirm::Flash)).unwrap().rect;
+        let y = track.centre().1 - app.top().1;
+        app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
+        app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
+        assert!(matches!(app.touch(Touch::Up, &f, 1000).as_slice(), [Effect::Flash { partition: "recovery", .. }]));
+        app.install(Event::Reflashed(Reflash::Written(vec![])), 1000);
+        app.install(Event::Finished(Outcome::Flashed { partition: "recovery", slots: vec![] }), 1000);
+        let _ = app.frame(&f, &i);
+        app.skyward_ended(SkywardEnd::Updated(vec![]), 2000);
+        let _ = app.frame(&f, &i);
+        app.skyward_ended(SkywardEnd::WriteFailed(vec![], "io".into()), 3000);
+        let _ = app.frame(&f, &i);
+    }
+
+    #[test]
     fn an_update_shows_its_steps_and_cannot_be_left() {
         let (f, i) = (fonts(), info());
         let mut app = sideloading(&f, &i);

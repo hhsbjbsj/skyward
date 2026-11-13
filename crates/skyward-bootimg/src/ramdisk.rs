@@ -40,6 +40,24 @@ impl Entry {
     pub fn is_dir(&self) -> bool {
         self.mode & S_IFMT == S_IFDIR
     }
+
+    pub fn is_regular(&self) -> bool {
+        self.mode & S_IFMT == S_IFREG
+    }
+}
+
+/// Compression framing used for a boot or recovery ramdisk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    Lz4Legacy,
+    Gzip,
+}
+
+impl Compression {
+    /// Detect the compression format from the compressed stream's leading magic.
+    pub fn of(bytes: &[u8]) -> Self {
+        if bytes.starts_with(&[0x1f, 0x8b]) { Self::Gzip } else { Self::Lz4Legacy }
+    }
 }
 
 /// An initramfs held in memory, so entries keep their owners, modes and
@@ -49,11 +67,18 @@ pub struct Ramdisk {
 }
 
 impl Ramdisk {
-    /// Unpack an LZ4 (legacy framing) compressed newc archive, as Android
-    /// boot images carry.
+    /// Unpack a compressed newc archive (LZ4 legacy framing or gzip), as
+    /// Android boot and recovery images carry.
     pub fn decode(compressed: &[u8]) -> Result<Self> {
         let mut cpio = Vec::new();
-        lz4_flex::frame::FrameDecoder::new(compressed).read_to_end(&mut cpio).context("lz4 decode")?;
+        match Compression::of(compressed) {
+            Compression::Gzip => {
+                flate2::read::MultiGzDecoder::new(compressed).read_to_end(&mut cpio).context("gzip decode")?;
+            }
+            Compression::Lz4Legacy => {
+                lz4_flex::frame::FrameDecoder::new(compressed).read_to_end(&mut cpio).context("lz4 decode")?;
+            }
+        }
         let mut entries = Vec::new();
         let mut rest = Cursor::new(cpio.as_slice());
         loop {
@@ -84,7 +109,20 @@ impl Ramdisk {
     /// with the reference `lz4` tool in legacy framing (the kernel's initramfs
     /// unpacker reads no other LZ4 framing) at its highest compression.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        lz4_tool(&self.archive()?)
+        self.encode_as(Compression::Lz4Legacy)
+    }
+
+    /// Pack as a newc archive with the requested compression format.
+    pub fn encode_as(&self, compression: Compression) -> Result<Vec<u8>> {
+        let raw = self.archive()?;
+        match compression {
+            Compression::Lz4Legacy => lz4_tool(&raw),
+            Compression::Gzip => {
+                let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                enc.write_all(&raw).context("gzip encode")?;
+                enc.finish().context("gzip finish")
+            }
+        }
     }
 
     /// Pack as a newc archive, uncompressed.
@@ -143,6 +181,23 @@ impl Ramdisk {
             }
             Some(_) => bail!("{name} is not a regular file"),
             None => bail!("{name} is not in the ramdisk"),
+        }
+    }
+
+    /// Replace an existing non-directory entry (regular file or symlink) with a
+    /// root-owned regular file, or add a new regular file when missing.
+    pub fn replace_or_add(&mut self, name: &str, mode: u32, data: Vec<u8>) -> Result<()> {
+        match self.entries.iter_mut().find(|e| e.name == name) {
+            Some(e) if e.mode & S_IFMT == S_IFREG => {
+                e.data = data;
+                Ok(())
+            }
+            Some(e) if !e.is_dir() => {
+                *e = root_entry(name, S_IFREG | mode, data);
+                Ok(())
+            }
+            Some(_) => bail!("{name} is a directory"),
+            None => self.add(name, mode, data),
         }
     }
 
@@ -452,5 +507,20 @@ mod tests {
         assert_eq!((unzip.data.as_slice(), unzip.mode, unzip.gid), (b"recovery".as_slice(), S_IFLNK | 0o755, 2000));
         assert_eq!(back.entries.len(), count, "no second entry of the name");
         assert!(back.find("system/bin/ziptool").is_some(), "what it pointed to stays");
+    }
+
+    #[test]
+    fn gzip_round_trip_and_replace_or_add() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.add("system/bin/recovery", 0o750, b"binary".to_vec()).unwrap();
+        rd.link("prop.default", "/cache/runtime.prop").unwrap();
+        let gz = rd.encode_as(Compression::Gzip).unwrap();
+        assert_eq!(Compression::of(&gz), Compression::Gzip);
+        let mut back = Ramdisk::decode(&gz).unwrap();
+        assert_eq!(back.find("system/bin/recovery").unwrap().data, b"binary");
+        back.replace_or_add("prop.default", 0o644, b"ro.debuggable=1\n".to_vec()).unwrap();
+        let prop = back.find("prop.default").unwrap();
+        assert!(prop.is_regular());
+        assert_eq!(prop.data, b"ro.debuggable=1\n");
     }
 }

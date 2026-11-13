@@ -288,6 +288,10 @@ pub struct Display {
     /// sliding over another rounds its leading corners to it.
     #[serde(default)]
     pub corner_radius: u32,
+    /// What is written after the panel turns back on (and at startup),
+    /// each value to its file.
+    #[serde(default)]
+    pub writes: Vec<Write>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -571,11 +575,19 @@ impl DeviceConfig {
                 ensure!(path.is_absolute() && plain && path.file_name().is_some(), "[[owners]] paths: {file} is not an absolute path to a file");
             }
         }
+        for write in &cfg.display.writes {
+            ensure!(Path::new(&write.path).is_absolute(), "[display] writes: {} is not an absolute path", write.path);
+        }
         if let Some(stock) = &cfg.stock {
             let name = stock.package.rsplit('/').next().unwrap_or_default();
+            let valid_source = if name.ends_with(".zip") {
+                name.contains(&stock.version)
+            } else {
+                name.ends_with(".img") || name.ends_with(".img.gz")
+            };
             ensure!(
-                stock.package.starts_with("https://") && name.ends_with(".zip") && name.contains(&stock.version) && !stock.version.is_empty(),
-                "[stock] package: {} is not an HTTPS address of the full package of {}",
+                stock.package.starts_with("https://") && !stock.version.is_empty() && valid_source,
+                "[stock] package: {} is not an HTTPS address of the full package or recovery image of {}",
                 stock.package,
                 stock.version
             );
@@ -868,7 +880,17 @@ mod tests {
         assert!(DeviceConfig::parse(&format!("{plain}recovery = \"{hash}\"\n")).is_err(), "over plain HTTP");
         let other = ok.replace("version = \"OS1.0.1.0", "version = \"OS1.0.2.0");
         assert!(DeviceConfig::parse(&format!("{other}recovery = \"{hash}\"\n")).is_err(), "the package of another build");
+        let raw = format!("[device]\ncodename = \"x\"\n[stock]\nversion = \"V1\"\npackage = \"https://d.example/recovery.img.gz\"\nrecovery = \"{hash}\"\n");
+        assert!(DeviceConfig::parse(&raw).is_ok());
         assert_eq!(DeviceConfig::parse("[device]\ncodename = \"x\"\n").unwrap().stock, None);
+    }
+
+    #[test]
+    fn display_writes_require_absolute_paths() {
+        let ok = "[device]\ncodename = \"x\"\n[display]\nwrites = [{ path = \"/sys/kernel/oppo_display/notify_panel_blank\", value = \"1\" }]\n";
+        assert!(DeviceConfig::parse(ok).is_ok());
+        let bad = "[device]\ncodename = \"x\"\n[display]\nwrites = [{ path = \"sys/foo\", value = \"1\" }]\n";
+        assert!(DeviceConfig::parse(bad).is_err());
     }
 
     #[test]
@@ -1024,5 +1046,37 @@ mod tests {
         assert!(!sensor.uses(Path::new("/mnt/system")), "its /system/lib64 is the recovery's own");
         assert!(!report.uses(Path::new("/vendor")));
         assert!(listeners.uses(Path::new("/vendor")));
+    }
+
+    #[test]
+    fn parses_pchm30() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/pchm30.toml")).unwrap();
+        assert_eq!(cfg.device.codename, "pchm30");
+        assert_eq!(cfg.device.brand, "OPPO");
+        assert_eq!(cfg.device.model, "OPPO A11x");
+        assert!(!cfg.device.ab);
+        assert_eq!(cfg.device.os_version_prop, "ro.build.display.id");
+        assert_eq!((cfg.display.width, cfg.display.height, cfg.display.density), (720, 1600, 320));
+        assert_eq!(cfg.display.writes.len(), 1);
+        assert_eq!(cfg.display.writes[0].path, "/sys/kernel/oppo_display/notify_panel_blank");
+        assert_eq!(cfg.firmware.as_ref().map(|f| f.partition.as_str()), Some("modem"));
+        assert_eq!(cfg.partitions.mounted, ["persist", "cache"]);
+        let paths: Vec<&str> = cfg.services.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/vendor/bin/qseecomd",
+                "/system/bin/hwservicemanager",
+                "/vendor/bin/hw/android.hardware.keymaster@4.0-service-qti",
+                "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti",
+            ]
+        );
+        assert_eq!(cfg.services[0].libraries, ["/system/lib64", "/vendor/lib64"]);
+        assert_eq!(cfg.services[2].ready_hardware_service.as_deref(), Some("android.hardware.keymaster@4.0::IKeymasterDevice/default"));
+        assert_eq!(cfg.services[3].ready_hardware_service.as_deref(), Some("android.hardware.gatekeeper@1.0::IGatekeeper/default"));
+        assert_eq!(cfg.backup.efs, ["modemst1", "modemst2", "fsg", "fsc", "oppostanvbk", "oppodycnvbk", "persist"]);
+        let stock = cfg.stock.expect("pchm30 defines a stock image");
+        assert_eq!(stock.version, "PCHM30_11_F.12");
+        assert!(stock.package.ends_with(".img.gz"));
     }
 }

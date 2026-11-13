@@ -263,7 +263,7 @@ fn main() -> Result<()> {
         }
         Cmd::Identify { file } => identify(&file),
         Cmd::Mount => {
-            let mounts = skyward_vab::mount_partitions(booted_slot()?)?;
+            let mounts = skyward_vab::mount_partitions(skyward_vab::current_slot()?)?;
             for d in &mounts.damaged {
                 println!("damaged: {d}");
             }
@@ -272,10 +272,10 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Umount => skyward_vab::unmount_partitions(booted_slot()?),
+        Cmd::Umount => skyward_vab::unmount_partitions(skyward_vab::current_slot()?),
         #[cfg(target_os = "android")]
         Cmd::Services { config } => {
-            let props = skyward_info::installed_props(booted_slot()?)?;
+            let props = skyward_info::installed_props(skyward_vab::current_slot()?)?;
             let mut services = DeviceConfig::load(&config)?.services;
             services.retain(|s| s.runs_on(&props));
             services::start(&services, secure::libraries()?.as_deref())?;
@@ -326,11 +326,17 @@ fn main() -> Result<()> {
         #[cfg(target_os = "android")]
         Cmd::Keymint { key, alias } => {
             let binder = skyward_binder::driver::Binder::open()?;
-            let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
+            let hardware = skyward_binder::driver::Binder::hardware().ok();
+            let service = skyward_crypto::KeyService::open(&binder, hardware.as_ref())?;
             let hw = service.hardware()?;
-            println!("keymint {} version {} at security level {} by {}", hw.name, hw.version, hw.security_level, hw.author);
+            println!("key service {} version {} at security level {} by {}", hw.name, hw.version, hw.security_level, hw.author);
             if let Some(alias) = alias {
-                let held = skyward_crypto::keystore2::key_blob(Path::new(skyward_crypto::keystore2::DATABASE), &alias)?;
+                let sqlite = Path::new(skyward_crypto::keystore2::DATABASE);
+                let held = if sqlite.exists() {
+                    skyward_crypto::keystore2::key_blob(sqlite, &alias)?
+                } else {
+                    skyward_crypto::keystore1::key_blob(Path::new(skyward_crypto::keystore1::DIRECTORY), 0, &alias)?
+                };
                 println!("{alias} is a key of {} bytes", held.len());
                 for (tag, value) in service.authorizations(&held, &[])? {
                     println!("  tag {tag} = {value} ({value:#x})");
@@ -386,7 +392,8 @@ fn main() -> Result<()> {
         Cmd::Data { credential, close: false } => {
             use skyward_crypto::data;
             let binder = skyward_binder::driver::Binder::open()?;
-            let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
+            let hardware = skyward_binder::driver::Binder::hardware().ok();
+            let service = skyward_crypto::KeyService::open(&binder, hardware.as_ref())?;
             let opening = data::open_without_credential(&service)?;
             match &opening.mounted {
                 Some(mounted) => {
@@ -486,9 +493,13 @@ fn load_modules(cfg: &DeviceConfig, names: &[String]) -> Result<Vec<PathBuf>> {
 /// driver and the touch processing. Of the programs the configuration
 /// names, only those this phone's build of the hardware runs are started.
 #[cfg(target_os = "android")]
-fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
+fn bring_up(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>) -> Result<()> {
     let nodes = skyward_sys::ueventd::apply()?;
     skyward_sys::kmsg(&format!("{nodes} device nodes given the owner their phone describes"))?;
+    for name in &cfg.partitions.mounted {
+        let at = skyward_block::fstab::mount(name)?;
+        skyward_sys::kmsg(&format!("{name} is mounted on {}", at.display()))?;
+    }
     let props = skyward_info::installed_props(slot)?;
     adopt_installed_version(&props)?;
     // Without logd the phone's own programs still run, and only what they
@@ -505,10 +516,6 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
     std::fs::write(FIRMWARE_FALLBACK, "1").with_context(|| format!("write 1 to {FIRMWARE_FALLBACK}"))?;
     if let Some(firmware) = &cfg.firmware {
         mount_firmware(&firmware.partition)?;
-    }
-    for name in &cfg.partitions.mounted {
-        let at = skyward_block::fstab::mount(name)?;
-        skyward_sys::kmsg(&format!("{name} is mounted on {}", at.display()))?;
     }
     for path in load_modules(cfg, &cfg.modules.load)? {
         skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
@@ -651,9 +658,11 @@ fn mount_firmware(partition: &str) -> Result<()> {
 #[cfg(target_os = "android")]
 const BUILD_VERSION: [&str; 3] = ["ro.build.version.release", "ro.build.version.security_patch", "ro.vendor.build.security_patch"];
 
-/// Set each of [`BUILD_VERSION`] to the installed system's value. An earlier
-/// run of the recovery service may have set it already, and init sets such
-/// a property only once.
+/// Set each of [`BUILD_VERSION`] to the installed system's value, plus
+/// optional vendor properties like `ro.vndk.version` when the recovery's own
+/// ramdisk left them unset (for example when `/vendor/default.prop` is not
+/// packed in recovery). An earlier run of the recovery service may have set
+/// it already, and init sets such a property only once.
 #[cfg(target_os = "android")]
 fn adopt_installed_version(props: &std::collections::HashMap<String, String>) -> Result<()> {
     for name in BUILD_VERSION {
@@ -662,6 +671,14 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
             skyward_sys::set_prop(name, value)?;
         }
         skyward_sys::kmsg(&format!("{name} is the installed system's {value}"))?;
+    }
+    for name in ["ro.vndk.version"] {
+        if let Some(value) = props.get(name) {
+            if skyward_sys::prop(name).is_none() {
+                skyward_sys::set_prop(name, value)?;
+            }
+            skyward_sys::kmsg(&format!("{name} is the installed system's {value}"))?;
+        }
     }
     Ok(())
 }
@@ -748,7 +765,7 @@ fn recovery() -> Result<()> {
             // erasing them, which may take super with them, and undoing
             // shared blocks, which writes to the slot's own.
             if !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
-                prepare(&cfg, booted_slot()?)?;
+                prepare(&cfg, skyward_vab::current_slot()?)?;
             }
             let root = Path::new("/");
             ui::run(&cfg, &root.join(ramdisk::FONT), &root.join(ramdisk::MONO), request, Screen::Home, None)
@@ -767,7 +784,7 @@ fn recovery() -> Result<()> {
 /// from them. Recovery has to stay usable when super cannot be mounted, as
 /// after it is wiped, so the reason goes to the kernel log instead.
 #[cfg(target_os = "android")]
-fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
+fn prepare(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>) -> Result<()> {
     match skyward_vab::mount_partitions(slot) {
         Ok(mounts) => {
             for d in &mounts.damaged {
@@ -925,4 +942,60 @@ fn modules(source: &str) -> Result<()> {
         println!("  {m}");
     }
     Ok(())
+}
+
+/// Extract the APEX package name from encoded `apex_manifest.pb` protobuf bytes
+/// (field 1, length-delimited UTF-8 string `name`).
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn apex_manifest_name(bytes: &[u8]) -> Option<&str> {
+    fn varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+        while *pos < bytes.len() && shift < 64 {
+            let b = bytes[*pos];
+            *pos += 1;
+            value |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return Some(value);
+            }
+            shift += 7;
+        }
+        None
+    }
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let tag = varint(bytes, &mut pos)?;
+        let field = tag >> 3;
+        match tag & 7 {
+            0 => {
+                varint(bytes, &mut pos)?;
+            }
+            1 => pos = pos.checked_add(8).filter(|&end| end <= bytes.len())?,
+            2 => {
+                let len = usize::try_from(varint(bytes, &mut pos)?).ok()?;
+                let end = pos.checked_add(len).filter(|&end| end <= bytes.len())?;
+                let slice = &bytes[pos..end];
+                pos = end;
+                if field == 1 {
+                    return std::str::from_utf8(slice).ok();
+                }
+            }
+            5 => pos = pos.checked_add(4).filter(|&end| end <= bytes.len())?,
+            _ => return None,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apex_manifest_name;
+
+    #[test]
+    fn parses_apex_manifest_pb_name() {
+        assert_eq!(apex_manifest_name(b"\n\x14com.android.vndk.v30\x10\x01"), Some("com.android.vndk.v30"));
+        assert_eq!(apex_manifest_name(b"\x10\x01\n\x14com.android.vndk.v30"), Some("com.android.vndk.v30"));
+        assert_eq!(apex_manifest_name(b"\n\x14short"), None);
+        assert_eq!(apex_manifest_name(b""), None);
+    }
 }

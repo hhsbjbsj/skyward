@@ -603,7 +603,7 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
         }
     }
     ctx.send(Event::Installing { version });
-    let kept = hold(ctx, slot)?;
+    let kept = hold(ctx, Some(slot))?;
     installed_boot_set()?;
     detach_once(ctx)?;
     // update_engine mounts /metadata itself, as in the stock recovery, keeps
@@ -620,7 +620,7 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
     Ok(match code? {
         0 => {
             if let Some(kept) = &kept {
-                reflash(ctx, kept, Ok(slot.other()));
+                reflash(ctx, kept, Ok(Some(slot.other())));
             }
             Done::Decided(Outcome::Installed { slot: slot.other(), wipe })
         }
@@ -631,7 +631,7 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
 /// This recovery, held before an install writes, when the screen asked to
 /// keep it in the recovery partitions; none when it was started without
 /// being flashed.
-fn hold(ctx: &Context, current: Slot) -> Result<Option<Kept>> {
+fn hold(ctx: &Context, current: Option<Slot>) -> Result<Option<Kept>> {
     if !ctx.options.keep {
         return Ok(None);
     }
@@ -645,10 +645,10 @@ fn hold(ctx: &Context, current: Slot) -> Result<Option<Kept>> {
 /// Write this recovery back into the recovery partitions the install wrote
 /// over and into that of `next`, the slot that starts next, telling the
 /// screen how far it is and then how it went.
-fn reflash(ctx: &Context, kept: &Kept, next: Result<Slot>) {
+fn reflash(ctx: &Context, kept: &Kept, next: Result<Option<Slot>>) {
     let slots = match next.and_then(|next| kept.wanted(next)) {
-        Ok(slots) if slots.is_empty() => return,
-        Ok(slots) => slots,
+        Ok(Some(slots)) => slots,
+        Ok(None) => return,
         Err(e) => return ctx.send(Event::Reflashed(Reflash::Failed(format!("{e:#}")))),
     };
     let mut told: Option<Instant> = None;
@@ -675,7 +675,7 @@ fn remount_metadata() -> Result<()> {
 
 /// The phone, and the system on it as its mounted partitions tell.
 fn phone(slot: Slot) -> Result<Phone> {
-    let props = skyward_info::installed_props(slot)?;
+    let props = skyward_info::installed_props(Some(slot))?;
     let installed = match (props.get("ro.build.date.utc"), props.get("ro.build.version.security_patch")) {
         (Some(time), Some(patch)) => Some(Build {
             timestamp: time.parse().with_context(|| format!("ro.build.date.utc {time:?}"))?,
@@ -801,7 +801,8 @@ fn lines(from: impl Read, mut each: impl FnMut(&str) -> io::Result<()>) -> io::R
 
 fn flash_image(ctx: &Context, kind: ImageKind, size: u64) -> Result<Done> {
     let dir = Path::new(skyward_block::BY_NAME);
-    let partitions = image::partitions(kind, dir)?;
+    let ab = skyward_vab::current_slot()?.is_some();
+    let partitions = image::partitions_for(kind, dir, ab)?;
     if partitions.is_empty() {
         return Ok(Done::Decided(Outcome::Refused(Refusal::NoPartition)));
     }
@@ -812,11 +813,15 @@ fn flash_image(ctx: &Context, kind: ImageKind, size: u64) -> Result<Done> {
         Ok(other) => bail!("an image waiting for its partition was told {other:?}"),
     };
     ensure!(partitions.contains(&partition), "{partition} is not among {partitions:?}");
-    ensure!(!slots.is_empty(), "no slot chosen for {partition}");
+    ensure!(!ab || !slots.is_empty(), "no slot chosen for {partition}");
     if [skyward_systems::store::BOOT, skyward_systems::store::INIT_BOOT].contains(&partition) {
         installed_boot_set()?;
     }
-    let devices: Vec<_> = slots.iter().map(|&slot| image::device(dir, partition, slot)).collect();
+    let devices: Vec<_> = if ab {
+        slots.iter().map(|&slot| image::device(dir, partition, Some(slot))).collect()
+    } else {
+        vec![image::device(dir, partition, None)]
+    };
     let mut file = BufReader::with_capacity(1 << 20, File::open(fuse::PACKAGE).context("open the package")?);
     let mut told: Option<Instant> = None;
     image::flash(&mut file, size, &devices, &mut |done, total| {
@@ -860,7 +865,7 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
             Ok(other) => bail!("a script waiting to be agreed to was told {other:?}"),
         }
     }
-    let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+    let slot = skyward_vab::current_slot()?;
     extract_script()?;
     shell_at_sbin()?;
     let kept = hold(ctx, slot)?;
@@ -868,12 +873,16 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
     detach_once(ctx)?;
     // While an update is in flight, the slot's partitions in super are its
     // and stay unmapped.
-    let mapped = match skyward_vab::snapshot_state()? {
-        SnapshotState::None => skyward_vab::map_slot(slot)?,
-        state => {
-            let _ = kmsg(&format!("install: the slot's partitions stay unmapped while an update is in flight ({state:?})"));
-            SlotMaps::default()
+    let mapped = if slot.is_some() {
+        match skyward_vab::snapshot_state()? {
+            SnapshotState::None => skyward_vab::map_slot(slot)?,
+            state => {
+                let _ = kmsg(&format!("install: the slot's partitions stay unmapped while an update is in flight ({state:?})"));
+                SlotMaps::default()
+            }
         }
+    } else {
+        skyward_vab::map_slot(None)?
     };
     let mounted = skyward_block::mount::mount_ids()?;
     let ran = run_binary(ctx);
@@ -884,7 +893,8 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
     // the recovery of the slot that starts next, which a package that
     // installs to the other slot switches to.
     if let Some(kept) = &kept {
-        reflash(ctx, kept, skyward_vab::boot::next_slot().context("ask which slot starts next"));
+        let next = slot.map(|_| skyward_vab::boot::next_slot().context("ask which slot starts next")).transpose();
+        reflash(ctx, kept, next);
     }
     let (code, wipe_cache) = ran?;
     Ok(Done::Script { code, wipe_cache })

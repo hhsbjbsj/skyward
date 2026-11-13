@@ -145,7 +145,11 @@ pub fn collect(cfg: &DeviceConfig) -> Result<DeviceInfo> {
     Ok(DeviceInfo {
         // The system names the exact edition; the configured model covers a
         // system whose partitions are not mounted.
-        model: system.get("ro.product.marketname").unwrap_or_else(|| cfg.device.model.clone()),
+        model: system
+            .get("ro.product.marketname")
+            .or_else(|| system.get("ro.oppo.market.name"))
+            .or_else(|| system.get("ro.vendor.oplus.market.name"))
+            .unwrap_or_else(|| cfg.device.model.clone()),
         codename: cfg.device.codename.clone(),
         soc: cfg.device.soc.clone(),
         cpu: cpu(Path::new(CPU))?,
@@ -179,10 +183,7 @@ impl SystemProps {
         if !skyward_config::ramdisk::in_recovery() {
             return Ok(SystemProps::Running);
         }
-        let props = match skyward_vab::current_slot()? {
-            Some(slot) => installed_props(slot)?,
-            None => HashMap::new(),
-        };
+        let props = installed_props(skyward_vab::current_slot()?)?;
         Ok(SystemProps::Installed(props))
     }
 
@@ -207,18 +208,27 @@ const BOOT_PROPS: &str = "ro.boot.";
 /// passes before it reads any of these, and a file may import another named
 /// after them, as Xiaomi's odm imports what each hardware version sets; so
 /// they come first here too, the same in a recovery as in the system.
-pub fn installed_props(slot: Slot) -> Result<HashMap<String, String>> {
+pub fn installed_props(slot: Option<Slot>) -> Result<HashMap<String, String>> {
     let base = |m: &skyward_vab::Mounted| -> String {
-        m.partition.strip_suffix(slot.suffix()).expect("mounted partitions carry the slot suffix").to_string()
+        match slot {
+            Some(s) => m.partition.strip_suffix(s.suffix()).expect("mounted partitions carry the slot suffix").to_string(),
+            None => m.partition.clone(),
+        }
     };
     let mut parts = skyward_vab::mounted_partitions(slot)?;
     parts.sort_by_key(|m| PROP_ORDER.iter().position(|b| *b == base(m)).unwrap_or(PROP_ORDER.len()));
     let mut props: HashMap<String, String> = skyward_sys::props(BOOT_PROPS).into_iter().collect();
     for m in &parts {
         let files: &[&str] = match base(m).as_str() {
-            "system" => &["system/build.prop"],
+            "system" => &[
+                "system/build.prop",
+                "system/system_ext/etc/build.prop",
+                "system/system_ext/build.prop",
+                "system/product/etc/build.prop",
+                "system/product/build.prop",
+            ],
             "vendor" => &["default.prop", "build.prop"],
-            _ => &["etc/build.prop"],
+            _ => &["etc/build.prop", "build.prop"],
         };
         for f in files {
             let path = m.mount_point.join(f);
@@ -230,6 +240,11 @@ pub fn installed_props(slot: Slot) -> Result<HashMap<String, String>> {
             rsproperties::load_properties_from_file(&path, None, "u:r:init:s0", &mut props)
                 .with_context(|| format!("read {}", path.display()))?;
         }
+    }
+    let runtime = Path::new("/cache/runtime.prop");
+    if runtime.try_exists().unwrap_or(false) {
+        rsproperties::load_properties_from_file(runtime, None, "u:r:init:s0", &mut props)
+            .with_context(|| format!("read {}", runtime.display()))?;
     }
     Ok(props)
 }

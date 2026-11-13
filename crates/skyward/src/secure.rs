@@ -65,6 +65,12 @@ const HARDWARE_DRIVER_NODE: &str = "/dev/binderfs/hwbinder";
 /// itself off when the running system does not describe it.
 const HARDWARE_DIRECTORY: &str = "android.hidl.manager@1.2::IServiceManager/default";
 
+/// The name init gives the older hardware service directory and the
+/// property it sets once answering, on recoveries whose init starts one
+/// before Skyward mounts the installed system.
+const HARDWARE_DIRECTORY_SERVICE: &str = "hwservicemanager";
+const HARDWARE_DIRECTORY_READY: &str = "hwservicemanager.ready";
+
 /// What says the directory is off. It is read by the services, and in a
 /// recovery there is nothing else to set it.
 const DIRECTORY_OFF: &str = "hwservicemanager.disabled";
@@ -127,6 +133,16 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     fs::write(RECOVERY_MANIFEST, describe_hardware(wanted)?).with_context(|| format!("write {RECOVERY_MANIFEST}"))?;
     fs::set_permissions(RECOVERY_MANIFEST, std::os::unix::fs::PermissionsExt::from_mode(0o644))
         .with_context(|| format!("let every user read {RECOVERY_MANIFEST}"))?;
+    // Stock recoveries that launch hwservicemanager on boot start it before
+    // partitions mount and before the recovery manifest is written; stop
+    // init's instance and clear readiness so Skyward supervises a fresh one
+    // against the installed system's labels and descriptions.
+    if skyward_sys::prop(&format!("init.svc.{HARDWARE_DIRECTORY_SERVICE}")).is_some_and(|s| s != "stopped") {
+        skyward_sys::set_prop("ctl.stop", HARDWARE_DIRECTORY_SERVICE)
+            .with_context(|| format!("have init stop {HARDWARE_DIRECTORY_SERVICE}"))?;
+        skyward_sys::wait_prop(&format!("init.svc.{HARDWARE_DIRECTORY_SERVICE}"), "stopped", STOP_TIMEOUT)?;
+        let _ = skyward_sys::set_prop(HARDWARE_DIRECTORY_READY, "false");
+    }
     // The directory turns itself off when it cannot find its own
     // description, and a run of it before this was written may have left
     // that behind.
@@ -156,10 +172,27 @@ fn describe_hardware(wanted: &[String]) -> Result<String> {
 
 /// Open the bundle of libraries the phone's own partitions were built
 /// against and give the directory they are in. A phone whose partitions
-/// need no bundle has none to open.
+/// need no bundle has none to open. QSSI phones often pack the VNDK under
+/// `com.android.vndk.current.apex` whose manifest still names the specific
+/// `com.android.vndk.v{version}` runtime directory that linker paths expect.
 pub fn libraries() -> Result<Option<PathBuf>> {
     let Some(version) = skyward_sys::prop(VENDOR_INTERFACE) else { return Ok(None) };
-    Ok(bundle(&format!("com.android.vndk.v{version}"))?.map(|at| at.join(BUNDLE_LIBS)))
+    let expected = format!("com.android.vndk.v{version}");
+    if let Some(at) = bundle(&expected)? {
+        return Ok(Some(at.join(BUNDLE_LIBS)));
+    }
+    let Some(file) = find_bundle("com.android.vndk.current") else {
+        return Ok(None);
+    };
+    if matches_manifest_name(&file, &expected)? {
+        return Ok(Some(mount_bundle(&file, &expected)?.join(BUNDLE_LIBS)));
+    }
+    Ok(None)
+}
+
+/// Locate `{name}.apex` in the phone's apex directories.
+fn find_bundle(name: &str) -> Option<PathBuf> {
+    BUNDLE_DIRS.iter().map(|d| Path::new(d).join(format!("{name}.apex"))).find(|p| p.is_file())
 }
 
 /// Open the bundle of this name where it lies, and give where it is. A
@@ -170,14 +203,42 @@ fn bundle(name: &str) -> Result<Option<PathBuf>> {
     if skyward_block::mount::is_mount_point(&at)? {
         return Ok(Some(at));
     }
-    let Some(file) = BUNDLE_DIRS.iter().map(|d| Path::new(d).join(format!("{name}.apex"))).find(|p| p.is_file()) else {
+    let Some(file) = find_bundle(name) else {
         return Ok(None);
     };
-    let (offset, length) = image(&file)?;
-    let device = skyward_block::loopdev::attach(&file, offset, length)?;
+    Ok(Some(mount_bundle(&file, name)?))
+}
+
+/// Mount an `.apex` payload image under `/apex/{mount_name}`.
+fn mount_bundle(file: &Path, mount_name: &str) -> Result<PathBuf> {
+    let at = Path::new(BUNDLE_MOUNT).join(mount_name);
+    let (offset, length) = image(file)?;
+    let device = skyward_block::loopdev::attach(file, offset, length)?;
     fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
     skyward_block::mount::mount_ro(&device, &at)?;
-    Ok(Some(at))
+    Ok(at)
+}
+
+/// Check whether an `.apex` archive's uncompressed `apex_manifest.pb` names `expected`.
+fn matches_manifest_name(file: &Path, expected: &str) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let f = fs::File::open(file).with_context(|| format!("open {}", file.display()))?;
+    let mut archive = zip::ZipArchive::new(f).with_context(|| format!("read what is in {}", file.display()))?;
+    let (start, size) = {
+        let Ok(entry) = archive.by_name("apex_manifest.pb") else {
+            return Ok(false);
+        };
+        if entry.compression() != zip::CompressionMethod::Stored {
+            return Ok(false);
+        }
+        let start = entry.data_start().with_context(|| format!("apex_manifest.pb in {} says where it is not", file.display()))?;
+        (start, usize::try_from(entry.size()).unwrap_or(usize::MAX).min(64 * 1024))
+    };
+    let mut f = archive.into_inner();
+    f.seek(SeekFrom::Start(start)).with_context(|| format!("seek apex_manifest.pb in {}", file.display()))?;
+    let mut buf = vec![0u8; size];
+    f.read_exact(&mut buf).with_context(|| format!("read apex_manifest.pb in {}", file.display()))?;
+    Ok(crate::apex_manifest_name(&buf) == Some(expected))
 }
 
 /// Where the filesystem lies inside a bundle.

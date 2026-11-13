@@ -64,11 +64,42 @@ impl Message {
         self.data.extend_from_slice(&v.to_le_bytes());
     }
 
+    /// Reserve bytes for a child buffer whose pointer will be written into a
+    /// parent struct before emitting its [`Self::embedded`] address object.
+    pub fn stash(&mut self, bytes: Vec<u8>) -> u64 {
+        self.keep(bytes)
+    }
+
+    /// Write a standalone pointer buffer object and return its address index.
+    pub fn buffer(&mut self, bytes: Vec<u8>) -> usize {
+        let length = bytes.len();
+        let at = self.keep(bytes);
+        self.address_at(at, length, None)
+    }
+
+    /// Write a pointer buffer object embedded inside `parent` at `offset`.
+    pub fn embedded(&mut self, at: u64, length: usize, parent: usize, offset: u64) -> usize {
+        self.address_at(at, length, Some((parent, offset)))
+    }
+
+    /// Start a `hidl_vec` from pre-serialized element bytes (`at`, `count`,
+    /// `byte_len`), returning the address index of the element buffer so nested
+    /// fields inside it can point back to it via [`Self::embedded`].
+    pub fn vec_from(&mut self, at: u64, count: usize, byte_len: usize) -> usize {
+        let mut frame = Vec::with_capacity(FRAME_BYTES);
+        frame.extend_from_slice(&at.to_le_bytes());
+        frame.extend_from_slice(&(count as u32).to_le_bytes());
+        frame.extend_from_slice(&[0; 4]);
+        let frame_at = self.keep(frame);
+        let frame_idx = self.address_at(frame_at, FRAME_BYTES, None);
+        self.address_at(at, byte_len, Some((frame_idx, 0)))
+    }
+
     /// A run of bytes: the frame that says where they are, then an address
     /// for the bytes themselves.
     pub fn bytes(&mut self, value: &[u8]) {
         let at = self.keep(value.to_vec());
-        self.framed(at, value.len(), value.len());
+        self.vec_from(at, value.len(), value.len());
     }
 
     /// Text, which is a run of bytes with a terminator the count leaves
@@ -77,7 +108,7 @@ impl Message {
         let mut raw = value.as_bytes().to_vec();
         raw.push(0);
         let at = self.keep(raw);
-        self.framed(at, value.len(), value.len() + 1);
+        self.vec_from(at, value.len(), value.len() + 1);
     }
 
     /// Hold on to bytes the driver will read, and say where they are.
@@ -88,32 +119,19 @@ impl Message {
         at
     }
 
-    /// The pair of addresses a run of bytes is written as: the frame, and
-    /// then the bytes it points at.
-    fn framed(&mut self, at: u64, count: usize, length: usize) {
-        let mut frame = Vec::with_capacity(FRAME_BYTES);
-        frame.extend_from_slice(&at.to_le_bytes());
-        frame.extend_from_slice(&(count as u32).to_le_bytes());
-        // Whoever reads the frame does not free what it points at.
-        frame.extend_from_slice(&[0; 4]);
-        let frame_at = self.keep(frame);
-        let parent = self.address(frame_at, FRAME_BYTES, None);
-        self.address(at, length, Some(parent));
-    }
-
     /// Write an address among the values and say where it sits, which is
     /// how the driver finds it. The answer is which address this is, for
     /// the one pointing inside it to name.
-    fn address(&mut self, at: u64, length: usize, inside: Option<usize>) -> usize {
+    fn address_at(&mut self, at: u64, length: usize, inside: Option<(usize, u64)>) -> usize {
         let which = self.addresses.len();
         self.addresses.push(self.data.len() as u64);
         self.data.extend_from_slice(&ADDRESS.to_le_bytes());
         self.data.extend_from_slice(&inside.map_or(0, |_| INSIDE_ANOTHER).to_le_bytes());
         self.data.extend_from_slice(&at.to_le_bytes());
         self.data.extend_from_slice(&(length as u64).to_le_bytes());
-        self.data.extend_from_slice(&(inside.unwrap_or(0) as u64).to_le_bytes());
-        // The address inside the frame is the frame's first field.
-        self.data.extend_from_slice(&0u64.to_le_bytes());
+        let (parent, offset) = inside.unwrap_or((0, 0));
+        self.data.extend_from_slice(&(parent as u64).to_le_bytes());
+        self.data.extend_from_slice(&offset.to_le_bytes());
         self.pointed += (length as u64).next_multiple_of(WORD);
         which
     }
@@ -161,6 +179,10 @@ impl<'a> Answer<'a> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().expect("four bytes")))
     }
 
+    pub fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("eight bytes")))
+    }
+
     /// A truth value: a byte, padded to four as everything is.
     pub fn bool(&mut self) -> Result<bool> {
         Ok(self.take(4)?[0] != 0)
@@ -168,7 +190,8 @@ impl<'a> Answer<'a> {
 
     /// The bytes an address in the reply points at. The driver has already
     /// moved them into this program's own room and rewritten the address,
-    /// so they are read where they lie.
+    /// so they are read where they lie. Empty embedded buffers arrive with a
+    /// zero length (and possibly a null pointer) and yield an empty slice.
     pub fn pointed(&mut self) -> Result<&'a [u8]> {
         let raw = self.take(ADDRESS_BYTES)?;
         let kind = u32::from_le_bytes(raw[0..4].try_into().expect("four bytes"));
@@ -177,10 +200,33 @@ impl<'a> Answer<'a> {
         }
         let at = u64::from_le_bytes(raw[8..16].try_into().expect("eight bytes"));
         let length = u64::from_le_bytes(raw[16..24].try_into().expect("eight bytes"));
+        if length == 0 {
+            return Ok(&[]);
+        }
         if at == 0 {
             bail!("the service left out something the call asked for");
         }
         Ok(unsafe { std::slice::from_raw_parts(at as *const u8, length as usize) })
+    }
+
+    /// Read a `hidl_vec<u8>` (16-byte frame followed by its element buffer).
+    pub fn bytes(&mut self) -> Result<Vec<u8>> {
+        let frame = self.pointed().context("read hidl_vec frame")?;
+        if frame.len() < FRAME_BYTES {
+            bail!("hidl_vec frame is {} bytes", frame.len());
+        }
+        let count = u32::from_le_bytes(frame[8..12].try_into().expect("four bytes")) as usize;
+        let data = self.pointed().context("read hidl_vec body")?;
+        if data.len() < count {
+            bail!("hidl_vec holds {} bytes, shorter than count {count}", data.len());
+        }
+        Ok(data[..count].to_vec())
+    }
+
+    /// Read a `hidl_string` (16-byte frame followed by UTF-8 bytes with trailing NUL).
+    pub fn hidl_string(&mut self) -> Result<String> {
+        let raw = self.bytes()?;
+        Ok(String::from_utf8_lossy(raw.strip_suffix(&[0]).unwrap_or(&raw)).into_owned())
     }
 
     /// Text the far side wrote as its own value rather than as a frame.
@@ -265,6 +311,10 @@ mod tests {
     /// Reads the parts of a written call back out of its own memory, the
     /// way the driver does: the values, and each address among them.
     fn written(m: &Message) -> Vec<(u32, u64, Vec<u8>)> {
+        written_at(m).into_iter().map(|(flags, inside, _offset, bytes)| (flags, inside, bytes)).collect()
+    }
+
+    fn written_at(m: &Message) -> Vec<(u32, u64, u64, Vec<u8>)> {
         m.addresses
             .iter()
             .map(|at| {
@@ -273,10 +323,10 @@ mod tests {
                 let points = u64::from_le_bytes(raw[8..16].try_into().unwrap());
                 let length = u64::from_le_bytes(raw[16..24].try_into().unwrap()) as usize;
                 let inside = u64::from_le_bytes(raw[24..32].try_into().unwrap());
-                let bytes = unsafe { std::slice::from_raw_parts(points as *const u8, length) }.to_vec();
+                let offset = u64::from_le_bytes(raw[32..40].try_into().unwrap());
+                let bytes = if length == 0 { Vec::new() } else { unsafe { std::slice::from_raw_parts(points as *const u8, length) }.to_vec() };
                 assert_eq!(u32::from_le_bytes(raw[0..4].try_into().unwrap()), ADDRESS);
-                assert_eq!(u64::from_le_bytes(raw[32..40].try_into().unwrap()), 0);
-                (flags, inside, bytes)
+                (flags, inside, offset, bytes)
             })
             .collect()
     }
@@ -355,5 +405,23 @@ mod tests {
         assert!(!read.bool().unwrap());
         assert_eq!(read.i32().unwrap(), 7, "what follows it starts four bytes on");
         assert!(Answer::new(&[1, 0]).bool().is_err());
+    }
+
+    #[test]
+    fn embedded_struct_records_parent_offset_and_empty_pointed_is_ok() {
+        let mut m = Message::call("a.b@1.0::IC");
+        let child = m.stash(vec![0xaa, 0xbb]);
+        let mut parent = vec![0u8; 56];
+        parent[0x28..0x30].copy_from_slice(&child.to_le_bytes());
+        parent[0x30..0x34].copy_from_slice(&2u32.to_le_bytes());
+        let parent_idx = m.buffer(parent);
+        m.embedded(child, 2, parent_idx, 0x28);
+        let parts = written_at(&m);
+        assert_eq!(parts[0], (0, 0, 0, parts[0].3.clone()));
+        assert_eq!(parts[1], (INSIDE_ANOTHER, parent_idx as u64, 0x28, vec![0xaa, 0xbb]));
+
+        let mut empty = vec![0u8; ADDRESS_BYTES];
+        empty[0..4].copy_from_slice(&ADDRESS.to_le_bytes());
+        assert_eq!(Answer::new(&empty).pointed().unwrap(), &[]);
     }
 }
