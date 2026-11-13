@@ -79,3 +79,8 @@ logs = [
 version = "PCHM30_11_F.12"
 package = "https://github.com/hhsbjbsj/skyward/releases/download/stock-pchm30/pchm30-stock-recovery.img.gz"
 recovery = "bcbfddea46590482ed533cb3438baaadd9201eaa35855b35fa871532ef6d3cc7"
+# PCHM30 has a 64 MiB recovery partition; its stock kernel enables CONFIG_RD_LZMA=y
+# and stock ColorOS/realmeUI UI fallback fonts under res/*/ttf are unused once
+# Skyward replaces system/bin/recovery.
+ramdisk_compression = "lzma"
+prune = ["res/ColorOS/ttf", "res/realmeUI/ttf"]

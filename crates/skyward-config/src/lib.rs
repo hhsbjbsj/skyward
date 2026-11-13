@@ -86,6 +86,16 @@ pub struct DeviceConfig {
     pub stock: Option<Stock>,
 }
 
+/// Compression format for repacking a stock recovery ramdisk when the
+/// stock format would overflow a constrained recovery partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RamdiskCompression {
+    Lz4,
+    Gzip,
+    Lzma,
+}
+
 /// The stock build a recovery is made on: the phone maker's full update
 /// package of it, whose recovery partition the recovery is built on top
 /// of, and that partition as it should come out of the package.
@@ -97,6 +107,13 @@ pub struct Stock {
     pub package: String,
     /// The recovery partition's SHA-256, in lowercase hex.
     pub recovery: String,
+    /// Optional ramdisk compression override for repacking the recovery image.
+    #[serde(default)]
+    pub ramdisk_compression: Option<RamdiskCompression>,
+    /// Stock ramdisk entries (relative paths or directory prefixes) unused
+    /// by Skyward that can be pruned before repacking.
+    #[serde(default)]
+    pub prune: Vec<String>,
 }
 
 /// What brings the phone's WLAN up inside a recovery, which loads none of
@@ -596,6 +613,14 @@ impl DeviceConfig {
                 "[stock] recovery: {} is not a SHA-256 in lowercase hex",
                 stock.recovery
             );
+            for path in &stock.prune {
+                let clean = Path::new(path);
+                let plain = clean.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+                ensure!(
+                    !path.is_empty() && !path.ends_with('/') && plain,
+                    "[stock] prune: {path} is not a relative ramdisk path"
+                );
+            }
         }
         if let Some(wlan) = &cfg.wlan {
             ensure!(wlan.probe.starts_with("http://"), "[wlan] probe: {} is not a plain HTTP address", wlan.probe);
@@ -882,6 +907,9 @@ mod tests {
         assert!(DeviceConfig::parse(&format!("{other}recovery = \"{hash}\"\n")).is_err(), "the package of another build");
         let raw = format!("[device]\ncodename = \"x\"\n[stock]\nversion = \"V1\"\npackage = \"https://d.example/recovery.img.gz\"\nrecovery = \"{hash}\"\n");
         assert!(DeviceConfig::parse(&raw).is_ok());
+        assert!(DeviceConfig::parse(&format!("{raw}ramdisk_compression = \"lzma\"\nprune = [\"res/ColorOS/ttf\"]\n")).is_ok());
+        assert!(DeviceConfig::parse(&format!("{raw}prune = [\"/res\"]\n")).is_err(), "absolute prune path");
+        assert!(DeviceConfig::parse(&format!("{raw}prune = [\"../etc\"]\n")).is_err(), "parent traversal in prune path");
         assert_eq!(DeviceConfig::parse("[device]\ncodename = \"x\"\n").unwrap().stock, None);
     }
 
@@ -1078,5 +1106,7 @@ mod tests {
         let stock = cfg.stock.expect("pchm30 defines a stock image");
         assert_eq!(stock.version, "PCHM30_11_F.12");
         assert!(stock.package.ends_with(".img.gz"));
+        assert_eq!(stock.ramdisk_compression, Some(RamdiskCompression::Lzma));
+        assert_eq!(stock.prune, ["res/ColorOS/ttf", "res/realmeUI/ttf"]);
     }
 }

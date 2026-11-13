@@ -118,6 +118,9 @@ fn main() -> Result<()> {
             }
             let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
             let cfg = skyward_config::DeviceConfig::load(&config)?;
+            for prefix in cfg.stock.iter().flat_map(|s| &s.prune) {
+                rd.remove_prefix(prefix);
+            }
             rd.replace(paths::RECOVERY, read(&binary)?)?;
             // Install scripts look for the commands a stock recovery lacks
             // among its programs, and its unzip there too, a link to ziptool
@@ -139,7 +142,13 @@ fn main() -> Result<()> {
             rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
             patch_props(&mut rd)?;
             disable_init_services(&mut rd, &cfg.services)?;
-            img.ramdisk = rd.encode_as(compression)?;
+            let out_compression = match cfg.stock.as_ref().and_then(|s| s.ramdisk_compression) {
+                Some(skyward_config::RamdiskCompression::Lz4) => Compression::Lz4Legacy,
+                Some(skyward_config::RamdiskCompression::Gzip) => Compression::Gzip,
+                Some(skyward_config::RamdiskCompression::Lzma) => Compression::Lzma,
+                None => compression,
+            };
+            img.ramdisk = rd.encode_as(out_compression)?;
             let bytes = img.to_bytes()?;
             write(&out, &img, &avb::footed(&bytes, "recovery", size, &Sha256::digest(&bytes))?)
         }
