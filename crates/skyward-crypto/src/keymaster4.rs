@@ -3,6 +3,7 @@
 
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
+#[cfg(target_os = "android")]
 use crate::keymint::Hardware;
 use crate::token::Token;
 use anyhow::{bail, Context, Result};
@@ -197,6 +198,7 @@ impl From<KmError> for anyhow::Error {
     }
 }
 
+#[cfg(target_os = "android")]
 fn parse_hardware_info(answer: &mut Answer) -> Result<Hardware> {
     answer.status().context("ask the keymaster service about itself")?;
     let security_level = answer.i32().context("read keymaster security level")?;

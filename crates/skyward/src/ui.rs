@@ -1014,7 +1014,7 @@ fn wlan_worker(w: &Option<wlan::Worker>) -> Result<&wlan::Worker> {
 /// The installed system, as the update server is told of it.
 fn installed(cfg: &DeviceConfig, info: &skyward_info::DeviceInfo) -> Result<Installed> {
     let slot = info.slot.context("only an A/B phone is updated")?;
-    let props = skyward_info::installed_props(slot)?;
+    let props = skyward_info::installed_props(Some(slot))?;
     let prop = |name: &str| props.get(name).cloned().with_context(|| format!("the installed system says no {name}"));
     Ok(Installed {
         device: prop("ro.product.mod_device")?,
