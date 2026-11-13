@@ -142,7 +142,7 @@ fn map(service: &KeyService) -> Result<(Vec<Entry>, PathBuf)> {
     let entry = entries.first().with_context(|| format!("the phone's own table says nothing about {MOUNT}"))?;
     let device = skyward_block::fstab::device(entry)?;
     let Some(encryption) = Encryption::of(entry)? else {
-        return Ok((entries, device));
+        return Ok((entries, PathBuf::from(device)));
     };
     let key = storage_key(service, entry, &encryption)?;
     let sectors = skyward_block::size_bytes(&device)? / 512;

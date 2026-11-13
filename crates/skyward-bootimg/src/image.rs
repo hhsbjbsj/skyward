@@ -212,16 +212,18 @@ impl Sha1 {
         }
         self.update(&bits.to_be_bytes());
         let mut out = [0u8; 20];
-        for (chunk, word) in out.chunks_exact_mut(4).zip(self.state) {
-            chunk.copy_from_slice(&word.to_be_bytes());
+        let (chunks, _) = out.as_chunks_mut::<4>();
+        for (chunk, word) in chunks.iter_mut().zip(self.state) {
+            *chunk = word.to_be_bytes();
         }
         out
     }
 
     fn compress(&mut self, block: &[u8; 64]) {
         let mut w = [0u32; 80];
-        for (dst, chunk) in w[..16].iter_mut().zip(block.chunks_exact(4)) {
-            *dst = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let (chunks, _) = block.as_chunks::<4>();
+        for (dst, chunk) in w[..16].iter_mut().zip(chunks) {
+            *dst = u32::from_be_bytes(*chunk);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
