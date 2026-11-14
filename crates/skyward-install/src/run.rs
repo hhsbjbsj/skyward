@@ -582,7 +582,7 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
         }
     }
     ctx.send(Event::Installing { version });
-    let kept = hold(ctx, slot)?;
+    let kept = hold(ctx, Some(slot))?;
     installed_boot_set()?;
     detach_once(ctx)?;
     // update_engine mounts /metadata itself, as in the stock recovery, keeps
@@ -654,7 +654,7 @@ fn remount_metadata() -> Result<()> {
 
 /// The phone, and the system on it as its mounted partitions tell.
 fn phone(slot: Slot) -> Result<Phone> {
-    let props = skyward_info::installed_props(slot)?;
+    let props = skyward_info::installed_props(Some(slot))?;
     let installed = match (props.get("ro.build.date.utc"), props.get("ro.build.version.security_patch")) {
         (Some(time), Some(patch)) => Some(Build {
             timestamp: time.parse().with_context(|| format!("ro.build.date.utc {time:?}"))?,

@@ -765,7 +765,7 @@ fn recovery() -> Result<()> {
             bcb::clear(&misc)?;
         }
         let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
-        if let Some(controller) = &cfg.stock.usb_controller {
+        if let Some(controller) = cfg.stock.as_ref().and_then(|s| s.usb_controller.as_deref()) {
             let _ = skyward_sys::set_prop("ro.boot.usbcontroller", controller);
         }
         skyward_sys::kmsg(&format!(
