@@ -190,7 +190,8 @@ impl<'a> Answer<'a> {
 
     /// The bytes an address in the reply points at. The driver has already
     /// moved them into this program's own room and rewritten the address,
-    /// so they are read where they lie.
+    /// so they are read where they lie. Empty embedded buffers arrive with a
+    /// zero length (and possibly a null pointer) and yield an empty slice.
     pub fn pointed(&mut self) -> Result<&'a [u8]> {
         let raw = self.take(ADDRESS_BYTES)?;
         let kind = u32::from_le_bytes(raw[0..4].try_into().expect("four bytes"));
@@ -199,10 +200,33 @@ impl<'a> Answer<'a> {
         }
         let at = u64::from_le_bytes(raw[8..16].try_into().expect("eight bytes"));
         let length = u64::from_le_bytes(raw[16..24].try_into().expect("eight bytes"));
+        if length == 0 {
+            return Ok(&[]);
+        }
         if at == 0 {
             bail!("the service left out something the call asked for");
         }
         Ok(unsafe { std::slice::from_raw_parts(at as *const u8, length as usize) })
+    }
+
+    /// Read a `hidl_vec<u8>` (16-byte frame followed by its element buffer).
+    pub fn bytes(&mut self) -> Result<Vec<u8>> {
+        let frame = self.pointed().context("read hidl_vec frame")?;
+        if frame.len() < FRAME_BYTES {
+            bail!("hidl_vec frame is {} bytes", frame.len());
+        }
+        let count = u32::from_le_bytes(frame[8..12].try_into().expect("four bytes")) as usize;
+        let data = self.pointed().context("read hidl_vec body")?;
+        if data.len() < count {
+            bail!("hidl_vec holds {} bytes, shorter than count {count}", data.len());
+        }
+        Ok(data[..count].to_vec())
+    }
+
+    /// Read a `hidl_string` (16-byte frame followed by UTF-8 bytes with trailing NUL).
+    pub fn hidl_string(&mut self) -> Result<String> {
+        let raw = self.bytes()?;
+        Ok(String::from_utf8_lossy(raw.strip_suffix(&[0]).unwrap_or(&raw)).into_owned())
     }
 
     /// Text the far side wrote as its own value rather than as a frame.

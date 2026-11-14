@@ -753,10 +753,10 @@ fn recovery() -> Result<()> {
         skyward_sys::keep_log(Path::new(skyward_sys::LOG))?;
         // Ensure the USB port transitions cleanly to adb through none
         // so init's property triggers rebind the controller.
-        if skyward_sys::prop("sys.usb.state").as_deref() != Some("adb") {
-            if let Err(e) = skyward_sys::usb::switch("adb", std::time::Duration::from_secs(5)) {
-                skyward_sys::kmsg(&format!("the USB port did not go to adb: {e:#}"))?;
-            }
+        if skyward_sys::prop("sys.usb.state").as_deref() != Some("adb")
+            && let Err(e) = skyward_sys::usb::switch("adb", std::time::Duration::from_secs(5))
+        {
+            skyward_sys::kmsg(&format!("the USB port did not go to adb: {e:#}"))?;
         }
         let misc = bcb::misc();
         let message = bcb::read(&misc)?;
