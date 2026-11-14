@@ -929,8 +929,24 @@ fn extract_script() -> Result<()> {
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("take away the {BINARY} an earlier install left")),
     }
+    let mut content = Vec::new();
+    script.read_to_end(&mut content).context("read the install script")?;
+    // AnyKernel3 includes a workaround for LineageOS Recovery (`echo "u:r:su:s0" > /proc/self/attr/current`)
+    // where LineageOS made `su` permissive. On stock-based recoveries, `recovery` is already
+    // permissive while `su` is enforcing and lacks permissions to run basic utilities or access pipes.
+    // Replace any transition to `su` so the installer stays in the permissive recovery domain.
+    let patched = if content.starts_with(b"#!") {
+        let text = String::from_utf8_lossy(&content);
+        if text.contains("u:r:su:s0") {
+            text.replace("u:r:su:s0", "u:r:recovery:s0").into_bytes()
+        } else {
+            content
+        }
+    } else {
+        content
+    };
     let mut out = OpenOptions::new().write(true).create_new(true).open(BINARY).with_context(|| format!("make {BINARY}"))?;
-    io::copy(&mut script, &mut out).with_context(|| format!("write {BINARY}"))?;
+    out.write_all(&patched).with_context(|| format!("write {BINARY}"))?;
     out.set_permissions(fs::Permissions::from_mode(0o755)).with_context(|| format!("make {BINARY} runnable"))
 }
 
@@ -971,6 +987,12 @@ impl Drop for Group {
 /// whether it asked for the cache partition to be erased after. What it
 /// leaves running is ended with it.
 fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
+    if let Ok(mut f) = OpenOptions::new().write(true).append(true).open("/default.prop") {
+        if let Some(dev) = prop("ro.product.device") {
+            let _ = writeln!(f, "\nro.product.device={dev}");
+            let _ = writeln!(f, "ro.build.product={dev}");
+        }
+    }
     let mut log = File::create(SCRIPT_LOG).with_context(|| format!("create {SCRIPT_LOG}"))?;
     let (requests_read, requests_write) = pipe(0)?;
     let (output_read, output_write) = pipe(0)?;

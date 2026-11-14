@@ -44,7 +44,7 @@ pub mod ramdisk {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct DeviceConfig {
     pub device: Device,
     #[serde(default)]
@@ -102,7 +102,7 @@ pub enum RamdiskCompression {
 /// The stock build a recovery is made on: the phone maker's full update
 /// package of it, whose recovery partition the recovery is built on top
 /// of, and that partition as it should come out of the package.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct Stock {
     /// The build's version, such as OS4.0.4.0.XPACNXM.
     pub version: String,
@@ -130,6 +130,9 @@ pub struct Stock {
     /// stop explicit `start` rules for beyond `[service]` / `[[service]]`.
     #[serde(default)]
     pub disable_services: Vec<String>,
+    /// Custom property overrides to inject into default.prop / prop.default.
+    #[serde(default)]
+    pub props: Vec<String>,
 }
 
 /// What brings the phone's WLAN up inside a recovery, which loads none of
@@ -289,7 +292,7 @@ pub struct Names {
     pub en: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Device {
     pub codename: String,
     #[serde(default)]

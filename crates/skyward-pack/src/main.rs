@@ -148,7 +148,7 @@ fn main() -> Result<()> {
             ) {
                 rd.add(paths::STOCK_RC, 0o644, stock_rc.into_bytes())?;
             }
-            patch_props(&mut rd, stock.and_then(|s| s.usb_controller.as_deref()))?;
+            patch_props(&mut rd, &cfg)?;
             let extra_disabled: &[String] = stock.map_or(&[], |s| s.disable_services.as_slice());
             disable_init_services(&mut rd, &cfg.services, extra_disabled)?;
             let out_compression = match cfg.stock.as_ref().and_then(|s| s.ramdisk_compression) {
@@ -240,7 +240,7 @@ fn take_stock_recovery(stock: &skyward_config::Stock, out: &Path) -> Result<()> 
 /// OPPO) symlink `prop.default` to a partition not mounted in early init and
 /// place overrides in `system/etc/prop.default` and/or `secure.prop`, so patch
 /// whichever property files init loads.
-fn patch_props(rd: &mut Ramdisk, usb_controller: Option<&str>) -> Result<()> {
+fn patch_props(rd: &mut Ramdisk, cfg: &skyward_config::DeviceConfig) -> Result<()> {
     const SYSTEM_PROP_DEFAULT: &str = "system/etc/prop.default";
     const SECURE_PROP: &str = "secure.prop";
     const RECOVERY_OVERRIDES: &[u8] = b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n";
@@ -255,6 +255,7 @@ fn patch_props(rd: &mut Ramdisk, usb_controller: Option<&str>) -> Result<()> {
     let target = if prop_regular { paths::PROP_DEFAULT } else { SYSTEM_PROP_DEFAULT };
     let existing = rd.find(target).filter(|e| e.is_regular()).map(|e| e.data.as_slice()).unwrap_or_default();
     let mut removed: Vec<&str> = BUILD_VERSION.to_vec();
+    let usb_controller = cfg.stock.as_ref().and_then(|s| s.usb_controller.as_deref());
     if usb_controller.is_some() {
         removed.push("sys.usb.controller");
     }
@@ -263,12 +264,28 @@ fn patch_props(rd: &mut Ramdisk, usb_controller: Option<&str>) -> Result<()> {
     if let Some(ctrl) = usb_controller {
         props.extend_from_slice(format!("sys.usb.controller={ctrl}\n").as_bytes());
     }
+    let codename = &cfg.device.codename;
+    let codename_upper = codename.to_uppercase();
+    let model = &cfg.device.model;
+    let brand = &cfg.device.brand;
+    props.extend_from_slice(format!(
+        "\nro.product.device={codename_upper}\nro.build.product={codename_upper}\nro.product.model={model}\nro.product.brand={brand}\nro.product.name={codename}\nro.build.type=userdebug\n"
+    ).as_bytes());
+    if let Some(stock) = &cfg.stock {
+        for prop in &stock.props {
+            props.extend_from_slice(prop.as_bytes());
+            props.push(b'\n');
+        }
+    }
     rd.replace_or_add(target, 0o644, props)?;
 
     if let Some(sec) = rd.find(SECURE_PROP).filter(|e| e.is_regular()) {
         let mut patched = without(&sec.data, &SECURE_OVERRIDES);
         patched.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\n");
         rd.replace(SECURE_PROP, patched)?;
+    }
+    if rd.find("default.prop").is_none() {
+        rd.link("default.prop", target)?;
     }
     Ok(())
 }
@@ -593,7 +610,20 @@ ro.vendor.build.security_patch=2026-10-01\nro.vendor.build.security_patch_level=
         rd.link("prop.default", "/cache/runtime.prop").unwrap();
         rd.link("default.prop", "system/etc/prop.default").unwrap();
         rd.add("secure.prop", 0o644, b"ro.debuggable=0\nro.adb.secure=1\nro.secure=1\n".to_vec()).unwrap();
-        patch_props(&mut rd, Some("a600000.dwc3")).unwrap();
+        let cfg = skyward_config::DeviceConfig {
+            device: skyward_config::Device {
+                codename: "ishtar".into(),
+                brand: "Xiaomi".into(),
+                model: "Xiaomi 13 Ultra".into(),
+                ..Default::default()
+            },
+            stock: Some(skyward_config::Stock {
+                usb_controller: Some("a600000.dwc3".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        patch_props(&mut rd, &cfg).unwrap();
         let etc = String::from_utf8(rd.find("system/etc/prop.default").unwrap().data.clone()).unwrap();
         assert!(etc.contains("ro.debuggable=1") && etc.contains("ro.adb.secure=0") && etc.contains("ro.secure=0"));
         assert!(etc.contains("sys.usb.controller=a600000.dwc3"));

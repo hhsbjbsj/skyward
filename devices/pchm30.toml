@@ -89,6 +89,14 @@ prune = ["res/ColorOS/ttf", "res/realmeUI/ttf"]
 # explicitly so adb and MTP come up and /dev/block/bootdevice resolves.
 usb_controller = "4e00000.dwc3"
 bootdevice = "/dev/block/platform/soc/4804000.ufshc"
+props = [
+    "ro.product.device=PCHM30",
+    "ro.build.product=PCHM30",
+    "ro.product.model=OPPO A11x",
+    "ro.product.brand=OPPO",
+    "ro.product.name=PCHM30",
+    "ro.build.type=userdebug",
+]
 # Stock recovery init.rc starts legacy crypto/gatekeeper/network/watchdog
 # daemons that conflict with Skyward's supervised HALs or crash-loop at boot.
 disable_services = [

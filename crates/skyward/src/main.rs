@@ -501,7 +501,7 @@ fn bring_up(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>) -> Result<()> {
         skyward_sys::kmsg(&format!("{name} is mounted on {}", at.display()))?;
     }
     let props = skyward_info::installed_props(slot)?;
-    adopt_installed_version(&props)?;
+    adopt_installed_version(cfg, &props)?;
     // Without logd the phone's own programs still run, and only what they
     // log is lost, so why it did not start goes to the kernel log.
     if let Some(logd) = &cfg.logd {
@@ -670,7 +670,7 @@ const BUILD_VERSION: [&str; 3] = ["ro.build.version.release", "ro.build.version.
 /// packed in recovery). An earlier run of the recovery service may have set
 /// it already, and init sets such a property only once.
 #[cfg(target_os = "android")]
-fn adopt_installed_version(props: &std::collections::HashMap<String, String>) -> Result<()> {
+fn adopt_installed_version(cfg: &DeviceConfig, props: &std::collections::HashMap<String, String>) -> Result<()> {
     for name in BUILD_VERSION {
         let value = props.get(name).with_context(|| format!("the installed system says no {name}"))?;
         if skyward_sys::prop(name).as_ref() != Some(value) {
@@ -684,6 +684,35 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
             skyward_sys::set_prop(name, value)?;
         }
         skyward_sys::kmsg(&format!("{name} is the installed system's {value}"))?;
+    }
+    let codename = &cfg.device.codename;
+    let codename_upper = codename.to_uppercase();
+    if skyward_sys::prop("ro.product.device").is_none() {
+        let val = props.get("ro.product.device")
+            .or_else(|| props.get("ro.product.system.device"))
+            .map(String::as_str)
+            .unwrap_or(&codename_upper);
+        let _ = skyward_sys::set_prop("ro.product.device", val);
+        skyward_sys::kmsg(&format!("ro.product.device set to {val}"))?;
+    }
+    if skyward_sys::prop("ro.build.product").as_deref().unwrap_or("unknown") == "unknown" {
+        let val = props.get("ro.build.product")
+            .map(String::as_str)
+            .unwrap_or(&codename_upper);
+        let _ = skyward_sys::set_prop("ro.build.product", val);
+        skyward_sys::kmsg(&format!("ro.build.product set to {val}"))?;
+    }
+    if skyward_sys::prop("ro.product.model").is_none() {
+        let _ = skyward_sys::set_prop("ro.product.model", &cfg.device.model);
+    }
+    if skyward_sys::prop("ro.product.brand").is_none() {
+        let _ = skyward_sys::set_prop("ro.product.brand", &cfg.device.brand);
+    }
+    if skyward_sys::prop("ro.product.name").is_none() {
+        let _ = skyward_sys::set_prop("ro.product.name", codename);
+    }
+    if skyward_sys::prop("ro.build.type").is_none() {
+        let _ = skyward_sys::set_prop("ro.build.type", "userdebug");
     }
     // The service directory is the recovery ramdisk's own program, and both
     // the mark on a call and the numbers of its methods are the ones that
