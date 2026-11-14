@@ -129,6 +129,7 @@ fn main() -> Result<()> {
             for command in paths::COMMANDS {
                 rd.link(command, recovery)?;
             }
+            rd.link(paths::SKYWARD, recovery)?;
             rd.add(paths::SYSTEM_INIT, 0o755, read(&system_init)?)?;
             rd.add(paths::CONFIG, 0o644, read(&config)?)?;
             rd.add(paths::FONT, 0o644, read(&font)?)?;

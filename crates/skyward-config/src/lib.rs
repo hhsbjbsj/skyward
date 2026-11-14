@@ -17,6 +17,8 @@ pub mod ramdisk {
     pub const MONO_LICENSE: &str = "skyward/KirkMono-OFL.txt";
     /// The recovery service binary init starts.
     pub const RECOVERY: &str = "system/bin/recovery";
+    /// The skyward cli command link beside recovery.
+    pub const SKYWARD: &str = "system/bin/skyward";
     /// The first program of a system installed beside the installed one,
     /// which Skyward puts in that system's init_boot image: linked
     /// statically, since it runs before any system's libraries are there.
@@ -26,8 +28,8 @@ pub mod ramdisk {
     /// stock recovery does not carry, and unzip, whose stock version holds
     /// all that `-p` takes out in memory. Each is a link to the recovery
     /// service binary beside it, which runs the command it is started as.
-    pub const COMMANDS: [&str; 6] =
-        ["system/bin/7za", "system/bin/avbctl", "system/bin/resetprop", "system/bin/skyward", "system/bin/unzip", "system/bin/zstd"];
+    pub const COMMANDS: [&str; 5] =
+        ["system/bin/7za", "system/bin/avbctl", "system/bin/resetprop", "system/bin/unzip", "system/bin/zstd"];
     /// The first property file init loads in recovery mode.
     pub const PROP_DEFAULT: &str = "prop.default";
     /// The scheduling profiles libprocessgroup reads.
