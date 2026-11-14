@@ -12,7 +12,6 @@ use crate::weaver::Weaver;
 use crate::KeyService;
 use anyhow::{Context, Result};
 use skyward_binder::driver::Binder;
-use skyward_block::dm::Target;
 use skyward_block::fsck::Checked;
 use skyward_block::fstab::Entry;
 use skyward_block::{dm, mount};

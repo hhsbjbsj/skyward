@@ -447,8 +447,8 @@ fn disable_managed_rc(
         if insert_at.is_some() && is_section {
             flush(&mut out, &mut insert_at, &mut has_disabled, &mut changed);
         }
-        if trimmed.starts_with("service ") {
-            let mut words = trimmed["service ".len()..].split_whitespace();
+        if let Some(stripped) = trimmed.strip_prefix("service ") {
+            let mut words = stripped.split_whitespace();
             let name = words.next().unwrap_or_default();
             let binary = words.next().unwrap_or_default();
             if managed.contains(binary) {

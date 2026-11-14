@@ -4,7 +4,7 @@
 //! recovery partitions: on a thread of their own that tells the screen how
 //! far they have come.
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use skyward_install::upgrade;
 use skyward_net::download::{self, Damaged, Failure, NoRoom, Progress, Refused, Sum};
 use skyward_net::github::{self, Build, Newest};
