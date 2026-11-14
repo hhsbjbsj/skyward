@@ -525,9 +525,17 @@ fn bring_up(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>) -> Result<()> {
         skyward_sys::kmsg(&format!("{handed} of the phone's own files handed to the accounts its init gives them"))?;
     }
     let hardware: Vec<String> = services.iter().filter_map(|s| s.ready_hardware_service.clone()).collect();
+    // The ramdisk's own directory keeps its loader and labels. Its programs
+    // were built against /system/lib64, so the installed system's vendor
+    // interface is not added to their library search path.
+    let recovery_owned = services.iter().any(|s| s.path == secure::RECOVERY_HARDWARE_DIRECTORY);
     if !hardware.is_empty() {
-        secure::prepare_hardware_directory(&hardware)?;
-        skyward_sys::kmsg("the directory for the phone's hardware services can run")?;
+        secure::prepare_hardware_directory(&hardware, recovery_owned)?;
+        skyward_sys::kmsg(if recovery_owned {
+            "the recovery's own hardware directory can run on the ramdisk's loader"
+        } else {
+            "the directory for the phone's hardware services can run"
+        })?;
     }
     // Only a program that has to register with the service directory needs
     // the directory to know the phone describes it. The WLAN's supplicant
@@ -541,7 +549,7 @@ fn bring_up(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>) -> Result<()> {
         let described = secure::publish_descriptions(&registering, &files)?;
         skyward_sys::kmsg(&format!("{described} of the phone's own service descriptions published"))?;
     }
-    let libraries = secure::libraries()?;
+    let libraries = if recovery_owned { None } else { secure::libraries()? };
     if let Some(dir) = &libraries {
         skyward_sys::kmsg(&format!("the phone's own libraries are at {}", dir.display()))?;
     }

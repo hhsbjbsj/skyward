@@ -71,6 +71,10 @@ const HARDWARE_DIRECTORY: &str = "android.hidl.manager@1.2::IServiceManager/defa
 const HARDWARE_DIRECTORY_SERVICE: &str = "hwservicemanager";
 const HARDWARE_DIRECTORY_READY: &str = "hwservicemanager.ready";
 
+/// The hardware directory a recovery ramdisk ships. It is built for that
+/// ramdisk's own loader and service labels, not for the installed system's.
+pub const RECOVERY_HARDWARE_DIRECTORY: &str = "/system/bin/hwservicemanager";
+
 /// What says the directory is off. It is read by the services, and in a
 /// recovery there is nothing else to set it.
 const DIRECTORY_OFF: &str = "hwservicemanager.disabled";
@@ -89,27 +93,33 @@ const RECOVERY_MANIFEST: &str = "/system/etc/vintf/manifest.xml";
 /// filesystem, does not have.
 ///
 /// `wanted` names the hardware services that will be asked for.
-pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
+/// `recovery_owned` is the ramdisk's own directory. It already has a loader
+/// and labels, and substituting the installed system's for those leaves it
+/// unable to answer: a key service looked up afterwards finds nobody there.
+pub fn prepare_hardware_directory(wanted: &[String], recovery_owned: bool) -> Result<()> {
     // A loader and the lowest libraries are built together and agree
     // between them on how a program's own storage is laid out, so the
     // installed system's programs are loaded by the installed system's
-    // loader rather than by the older one a recovery carries.
-    let loader = Path::new(EARLY_LOADER);
-    let from = bundle(RUNTIME_BUNDLE)?
-        .map(|at| at.join(BUNDLE_LOADER))
-        .filter(|p| p.is_file())
-        .with_context(|| format!("the installed system carries no {RUNTIME_BUNDLE}, which holds the loader its own programs ask for"))?;
-    let dir = loader.parent().expect("the loader is in a directory");
-    fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
-    // Made under the recovery's own umask the folder is root's alone, and
-    // the programs that ask for this loader run as the users their init
-    // scripts name: as the system's own folder is, it is open to all.
-    fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .with_context(|| format!("open {} to every user", dir.display()))?;
-    if loader.exists() {
-        fs::remove_file(loader).with_context(|| format!("take away {}", loader.display()))?;
+    // loader rather than by the older one a recovery carries. The ramdisk's
+    // own directory was built for the loader beside it, and keeps that.
+    if !recovery_owned {
+        let loader = Path::new(EARLY_LOADER);
+        let from = bundle(RUNTIME_BUNDLE)?
+            .map(|at| at.join(BUNDLE_LOADER))
+            .filter(|p| p.is_file())
+            .with_context(|| format!("the installed system carries no {RUNTIME_BUNDLE}, which holds the loader its own programs ask for"))?;
+        let dir = loader.parent().expect("the loader is in a directory");
+        fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
+        // Made under the recovery's own umask the folder is root's alone, and
+        // the programs that ask for this loader run as the users their init
+        // scripts name: as the system's own folder is, it is open to all.
+        fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .with_context(|| format!("open {} to every user", dir.display()))?;
+        if loader.exists() {
+            fs::remove_file(loader).with_context(|| format!("take away {}", loader.display()))?;
+        }
+        std::os::unix::fs::symlink(&from, loader).with_context(|| format!("point {} at {}", loader.display(), from.display()))?;
     }
-    std::os::unix::fs::symlink(&from, loader).with_context(|| format!("point {} at {}", loader.display(), from.display()))?;
     let driver = Path::new(HARDWARE_DRIVER);
     if !driver.exists() {
         std::os::unix::fs::symlink(HARDWARE_DRIVER_NODE, driver)
@@ -121,22 +131,27 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     // as the users their init scripts name.
     fs::set_permissions(driver, std::os::unix::fs::PermissionsExt::from_mode(0o666))
         .with_context(|| format!("open {HARDWARE_DRIVER} to every program"))?;
-    let from = Path::new(SERVICE_LABELS);
-    let into = Path::new(RECOVERY_LABELS).join(from.file_name().expect("a named file"));
-    fs::create_dir_all(RECOVERY_LABELS).with_context(|| format!("make {RECOVERY_LABELS}"))?;
-    // The directory reads both of these as the user its init script names,
-    // and what the recovery makes under its own umask is root's alone: they
-    // are given the modes the system's own copies have.
-    fs::set_permissions(RECOVERY_LABELS, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .with_context(|| format!("open {RECOVERY_LABELS} to every user"))?;
-    fs::copy(from, &into).with_context(|| format!("copy {} to {}", from.display(), into.display()))?;
+    // The ramdisk already says which domain may register each service. The
+    // installed system's copy names domains that ramdisk program does not run as.
+    if !recovery_owned {
+        let from = Path::new(SERVICE_LABELS);
+        let into = Path::new(RECOVERY_LABELS).join(from.file_name().expect("a named file"));
+        fs::create_dir_all(RECOVERY_LABELS).with_context(|| format!("make {RECOVERY_LABELS}"))?;
+        // The directory reads both of these as the user its init script names,
+        // and what the recovery makes under its own umask is root's alone: they
+        // are given the modes the system's own copies have.
+        fs::set_permissions(RECOVERY_LABELS, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .with_context(|| format!("open {RECOVERY_LABELS} to every user"))?;
+        fs::copy(from, &into).with_context(|| format!("copy {} to {}", from.display(), into.display()))?;
+    }
     fs::write(RECOVERY_MANIFEST, describe_hardware(wanted)?).with_context(|| format!("write {RECOVERY_MANIFEST}"))?;
     fs::set_permissions(RECOVERY_MANIFEST, std::os::unix::fs::PermissionsExt::from_mode(0o644))
         .with_context(|| format!("let every user read {RECOVERY_MANIFEST}"))?;
-    // Stock recoveries that launch hwservicemanager on boot start it before
-    // partitions mount and before the recovery manifest is written; stop
-    // init's instance and clear readiness so Skyward supervises a fresh one
-    // against the installed system's labels and descriptions.
+    // A directory that is already running read the descriptions that were
+    // there before the ones just written. Stop it so the process that next
+    // answers has read the services that will be asked for. The service
+    // list starts that process before any program that can fail to become
+    // ready: otherwise the driver is left with nobody answering.
     if skyward_sys::prop(&format!("init.svc.{HARDWARE_DIRECTORY_SERVICE}")).is_some_and(|s| s != "stopped") {
         skyward_sys::set_prop("ctl.stop", HARDWARE_DIRECTORY_SERVICE)
             .with_context(|| format!("have init stop {HARDWARE_DIRECTORY_SERVICE}"))?;
