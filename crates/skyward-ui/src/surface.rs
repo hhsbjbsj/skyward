@@ -477,6 +477,21 @@ pub mod kms {
         Off,
     }
 
+    #[derive(Clone, Copy)]
+    struct PlaneSetup {
+        handle: plane::Handle,
+        fb_prop: property::Handle,
+        crtc_prop: property::Handle,
+        src_x: (property::Handle, u64),
+        src_y: (property::Handle, u64),
+        src_w: (property::Handle, u64),
+        src_h: (property::Handle, u64),
+        crtc_x: (property::Handle, i64),
+        crtc_y: (property::Handle, i64),
+        crtc_w: (property::Handle, u64),
+        crtc_h: (property::Handle, u64),
+    }
+
     pub struct KmsSurface {
         card: Card,
         bufs: [Buf; 3],
@@ -485,8 +500,8 @@ pub mod kms {
         /// A frame was committed whose flip has not come yet.
         flipping: bool,
         /// The planes showing the buffer, one per layer mixer, with their
-        /// FB_ID properties.
-        planes: Vec<(plane::Handle, property::Handle)>,
+        /// FB_ID and layout properties.
+        planes: Vec<PlaneSetup>,
         /// The CRTC driving the panel, with its ACTIVE and MODE_ID
         /// properties.
         crtc: drm::control::crtc::Handle,
@@ -694,24 +709,46 @@ pub mod kms {
             for (i, (plane, _, props, _)) in candidates.iter().enumerate() {
                 let x = strip * i as u32;
                 let fb_prop = props.handle("FB_ID")?;
+                let crtc_prop = props.handle("CRTC_ID")?;
+                let src_x = (props.handle("SRC_X")?, (x as u64) << 16);
+                let src_y = (props.handle("SRC_Y")?, 0);
+                let src_w = (props.handle("SRC_W")?, (strip as u64) << 16);
+                let src_h = (props.handle("SRC_H")?, (h as u64) << 16);
+                let crtc_x = (props.handle("CRTC_X")?, x as i64);
+                let crtc_y = (props.handle("CRTC_Y")?, 0);
+                let crtc_w = (props.handle("CRTC_W")?, strip as u64);
+                let crtc_h = (props.handle("CRTC_H")?, h as u64);
+
                 req.add_property(*plane, fb_prop, property::Value::Framebuffer(Some(bufs[0].fb)));
-                req.add_property(*plane, props.handle("CRTC_ID")?, property::Value::CRTC(Some(crtc)));
-                req.add_property(*plane, props.handle("SRC_X")?, property::Value::UnsignedRange((x as u64) << 16));
-                req.add_property(*plane, props.handle("SRC_Y")?, property::Value::UnsignedRange(0));
-                req.add_property(*plane, props.handle("SRC_W")?, property::Value::UnsignedRange((strip as u64) << 16));
-                req.add_property(*plane, props.handle("SRC_H")?, property::Value::UnsignedRange((h as u64) << 16));
-                req.add_property(*plane, props.handle("CRTC_X")?, property::Value::SignedRange(x as i64));
-                req.add_property(*plane, props.handle("CRTC_Y")?, property::Value::SignedRange(0));
-                req.add_property(*plane, props.handle("CRTC_W")?, property::Value::UnsignedRange(strip as u64));
-                req.add_property(*plane, props.handle("CRTC_H")?, property::Value::UnsignedRange(h as u64));
-                planes.push((*plane, fb_prop));
+                req.add_property(*plane, crtc_prop, property::Value::CRTC(Some(crtc)));
+                req.add_property(*plane, src_x.0, property::Value::UnsignedRange(src_x.1));
+                req.add_property(*plane, src_y.0, property::Value::UnsignedRange(src_y.1));
+                req.add_property(*plane, src_w.0, property::Value::UnsignedRange(src_w.1));
+                req.add_property(*plane, src_h.0, property::Value::UnsignedRange(src_h.1));
+                req.add_property(*plane, crtc_x.0, property::Value::SignedRange(crtc_x.1));
+                req.add_property(*plane, crtc_y.0, property::Value::SignedRange(crtc_y.1));
+                req.add_property(*plane, crtc_w.0, property::Value::UnsignedRange(crtc_w.1));
+                req.add_property(*plane, crtc_h.0, property::Value::UnsignedRange(crtc_h.1));
+                planes.push(PlaneSetup {
+                    handle: *plane,
+                    fb_prop,
+                    crtc_prop,
+                    src_x,
+                    src_y,
+                    src_w,
+                    src_h,
+                    crtc_x,
+                    crtc_y,
+                    crtc_w,
+                    crtc_h,
+                });
             }
             // The panel comes up in its preferred mode, then switches to the
             // fastest, as `to_fastest` says why.
             commit(&card, req, AtomicCommitFlags::ALLOW_MODESET).context("set the panel mode")?;
             let fastest = (mode.vrefresh() != preferred.vrefresh()).then_some(blob);
 
-            let ids: Vec<u32> = planes.iter().map(|p| u32::from(p.0)).collect();
+            let ids: Vec<u32> = planes.iter().map(|p| u32::from(p.handle)).collect();
             let summary = format!(
                 "{:?} connector {} mode {:?} {w}x{h} {} Hz, crtc {}, planes {ids:?} {:?}{}",
                 conn.interface(),
@@ -877,8 +914,19 @@ pub mod kms {
                 }
             }
             let mut req = atomic::AtomicModeReq::new();
-            for &(plane, fb_prop) in &self.planes {
-                req.add_property(plane, fb_prop, property::Value::Framebuffer(Some(buf.fb)));
+            for p in &self.planes {
+                req.add_property(p.handle, p.fb_prop, property::Value::Framebuffer(Some(buf.fb)));
+                if self.power == Power::Off {
+                    req.add_property(p.handle, p.crtc_prop, property::Value::CRTC(Some(self.crtc)));
+                    req.add_property(p.handle, p.src_x.0, property::Value::UnsignedRange(p.src_x.1));
+                    req.add_property(p.handle, p.src_y.0, property::Value::UnsignedRange(p.src_y.1));
+                    req.add_property(p.handle, p.src_w.0, property::Value::UnsignedRange(p.src_w.1));
+                    req.add_property(p.handle, p.src_h.0, property::Value::UnsignedRange(p.src_h.1));
+                    req.add_property(p.handle, p.crtc_x.0, property::Value::SignedRange(p.crtc_x.1));
+                    req.add_property(p.handle, p.crtc_y.0, property::Value::SignedRange(p.crtc_y.1));
+                    req.add_property(p.handle, p.crtc_w.0, property::Value::UnsignedRange(p.crtc_w.1));
+                    req.add_property(p.handle, p.crtc_h.0, property::Value::UnsignedRange(p.crtc_h.1));
+                }
             }
             let mut flags = AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT;
             if self.power != Power::On {

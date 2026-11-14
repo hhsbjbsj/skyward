@@ -317,11 +317,14 @@ fn render_stock_rc(usb_controller: Option<&str>, bootdevice: Option<&str>) -> Op
     let mut rc = String::from("# Hardware fallbacks injected by skyward-pack\n");
     if let Some(ctrl) = usb_controller {
         rc.push_str(&format!(
-            "\non early-init\n    setprop sys.usb.controller {ctrl}\n\non init\n    setprop sys.usb.controller {ctrl}\n    write /sys/class/udc/{ctrl}/device/../mode peripheral\n\non fs\n    write /sys/class/udc/{ctrl}/device/../mode peripheral\n"
+            "\non early-init\n    setprop sys.usb.controller {ctrl}\n\non init\n    setprop sys.usb.controller {ctrl}\n    write /sys/class/udc/{ctrl}/device/../mode peripheral\n\non fs\n    write /sys/class/udc/{ctrl}/device/../mode peripheral\n\non boot\n    setprop sys.usb.controller {ctrl}\n    write /sys/class/udc/{ctrl}/device/../mode peripheral\n"
         ));
     }
     if let Some(target) = bootdevice {
-        rc.push_str(&format!("\non post-fs\n    symlink {target} /dev/block/bootdevice\n"));
+        let name = target.rsplit('/').next().unwrap_or(target);
+        rc.push_str(&format!(
+            "\non early-init\n    setprop ro.boot.bootdevice {name}\n\non post-fs\n    symlink {target} /dev/block/bootdevice\n"
+        ));
     }
     Some(rc)
 }
@@ -616,7 +619,7 @@ service hal_cryptoeng_oppo /system/bin/hw/vendor.oplus.hardware.cryptoeng@1.0-se
     class late_start
     seclabel u:r:recovery:s0
 
-service qseecomd /vendor/bin/qseecomd
+service qseecomd /system/bin/qseecomd
     disabled
     seclabel u:r:recovery:s0
 

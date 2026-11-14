@@ -1131,9 +1131,9 @@ mod tests {
         assert_eq!(
             paths,
             [
-                "/vendor/bin/qseecomd",
+                "/system/bin/qseecomd",
                 "/system/bin/hwservicemanager",
-                "/vendor/bin/hw/android.hardware.keymaster@4.0-service-qti",
+                "/system/bin/android.hardware.keymaster@4.0-service-qti",
                 "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti",
             ]
         );
@@ -1146,8 +1146,8 @@ mod tests {
         assert!(stock.package.ends_with(".img.gz"));
         assert_eq!(stock.ramdisk_compression, Some(RamdiskCompression::Lzma));
         assert_eq!(stock.prune, ["res/ColorOS/ttf", "res/realmeUI/ttf"]);
-        assert_eq!(stock.usb_controller.as_deref(), Some("a600000.dwc3"));
-        assert_eq!(stock.bootdevice.as_deref(), Some("/dev/block"));
+        assert_eq!(stock.usb_controller.as_deref(), Some("4e00000.dwc3"));
+        assert_eq!(stock.bootdevice.as_deref(), Some("/dev/block/platform/soc/4804000.ufshc"));
         assert!(stock.disable_services.iter().any(|s| s == "/system/bin/gatekeeperd"));
     }
 }
