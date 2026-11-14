@@ -146,11 +146,11 @@ pub fn install_key_explicit(
     let dir = std::fs::File::open(mount).with_context(|| format!("open {}", mount.display()))?;
     if unsafe { libc::ioctl(dir.as_raw_fd(), ADD_KEY as libc::Ioctl, arg.as_mut_ptr()) } != 0 {
         let err = std::io::Error::last_os_error();
-        if let (Some(d), false, Some(code)) = (desc, wrapped, err.raw_os_error()) {
-            if matches!(code, libc::ENOTTY | libc::EOPNOTSUPP | libc::EINVAL) {
-                add_legacy_v1_key(raw, &d)?;
-                return Ok(d.to_vec());
-            }
+        if let (Some(d), false, Some(code)) = (desc, wrapped, err.raw_os_error())
+            && matches!(code, libc::ENOTTY | libc::EOPNOTSUPP | libc::EINVAL)
+        {
+            add_legacy_v1_key(raw, &d)?;
+            return Ok(d.to_vec());
         }
         return Err(err).with_context(|| format!("let a key into {}", mount.display()));
     }

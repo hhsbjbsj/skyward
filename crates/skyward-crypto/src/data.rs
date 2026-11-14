@@ -86,10 +86,10 @@ fn open(service: &KeyService) -> Result<Opened> {
     match mounted {
         Ok((checked, filesystem)) => Ok(Opened { mapped, filesystem, checked }),
         Err(e) => {
-            if matches!(dm::status(MAPPED), Ok(Some(_))) {
-                if let Err(r) = dm::remove(MAPPED) {
-                    return Err(e.context(format!("removing {MAPPED} afterwards failed too: {r:#}")));
-                }
+            if matches!(dm::status(MAPPED), Ok(Some(_)))
+                && let Err(r) = dm::remove(MAPPED)
+            {
+                return Err(e.context(format!("removing {MAPPED} afterwards failed too: {r:#}")));
             }
             Err(e)
         }
@@ -343,10 +343,10 @@ fn protector(user: u32) -> Result<crate::user::Protector> {
     let mut ids = Vec::new();
     for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
         let path = entry.with_context(|| format!("read {}", dir.display()))?.path();
-        if path.extension().is_some_and(|e| e == "spblob") {
-            if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
-                ids.push(id.to_string());
-            }
+        if path.extension().is_some_and(|e| e == "spblob")
+            && let Some(id) = path.file_stem().and_then(|s| s.to_str())
+        {
+            ids.push(id.to_string());
         }
     }
     let id = match crate::locksettings::current_protector(Path::new(crate::locksettings::DATABASE), user)? {
