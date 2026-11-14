@@ -277,7 +277,7 @@ fn patch_props(rd: &mut Ramdisk, cfg: &skyward_config::DeviceConfig) -> Result<(
             props.push(b'\n');
         }
     }
-    rd.replace_or_add(target, 0o644, props)?;
+    rd.replace_or_add(target, 0o644, props.clone())?;
 
     if let Some(sec) = rd.find(SECURE_PROP).filter(|e| e.is_regular()) {
         let mut patched = without(&sec.data, &SECURE_OVERRIDES);
