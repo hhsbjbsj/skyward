@@ -954,13 +954,59 @@ fn extract_script() -> Result<()> {
 fn shell_at_sbin() -> Result<()> {
     let link = Path::new(SBIN_SHELL);
     match fs::symlink_metadata(link) {
-        Ok(_) => return Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            let dir = link.parent().expect("the link is in a folder");
+            fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
+            symlink(SHELL, link).with_context(|| format!("link {SBIN_SHELL} to {SHELL}"))?;
+        }
         Err(e) => return Err(e).with_context(|| format!("look at {SBIN_SHELL}")),
     }
-    let dir = link.parent().expect("the link is in a folder");
-    fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
-    symlink(SHELL, link).with_context(|| format!("link {SBIN_SHELL} to {SHELL}"))
+
+    // Ensure /default.prop is a regular file in rootfs so it won't disappear when AnyKernel3 binds /system
+    if let Ok(meta) = fs::symlink_metadata("/default.prop") {
+        if meta.file_type().is_symlink() {
+            if let Ok(content) = fs::read("/default.prop") {
+                let _ = fs::remove_file("/default.prop");
+                let _ = fs::write("/default.prop", content);
+            }
+        }
+    }
+
+    // Provide /sbin/getprop wrapper for AnyKernel3 and other recovery scripts
+    let dev = prop("ro.product.device").unwrap_or_default();
+    let getprop_script = format!(
+        r#"#!/sbin/sh
+if [ -z "$1" ]; then
+    cat /default.prop 2>/dev/null
+    exit 0
+fi
+case "$1" in
+    ro.product.device|ro.build.product|ro.product.vendor.device|ro.vendor.product.device)
+        echo "{dev}"
+        exit 0
+        ;;
+    ro.build.type)
+        echo "userdebug"
+        exit 0
+        ;;
+esac
+val=$(grep "^$1=" /default.prop 2>/dev/null | tail -n1 | cut -d= -f2-)
+if [ -n "$val" ]; then
+    echo "$val"
+    exit 0
+fi
+val=$(grep "^$1=" /vendor/build.prop 2>/dev/null | tail -n1 | cut -d= -f2-)
+if [ -n "$val" ]; then
+    echo "$val"
+    exit 0
+fi
+"#
+    );
+    let _ = fs::write("/sbin/getprop", getprop_script);
+    let _ = fs::set_permissions("/sbin/getprop", fs::Permissions::from_mode(0o755));
+
+    Ok(())
 }
 
 /// A line one of the install script's outputs gave.
@@ -987,10 +1033,13 @@ impl Drop for Group {
 /// whether it asked for the cache partition to be erased after. What it
 /// leaves running is ended with it.
 fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
-    if let Ok(mut f) = OpenOptions::new().write(true).append(true).open("/default.prop") {
+    if let Ok(mut f) = OpenOptions::new().append(true).open("/default.prop") {
         if let Some(dev) = prop("ro.product.device") {
             let _ = writeln!(f, "\nro.product.device={dev}");
             let _ = writeln!(f, "ro.build.product={dev}");
+            let _ = writeln!(f, "ro.product.vendor.device={dev}");
+            let _ = writeln!(f, "ro.vendor.product.device={dev}");
+            let _ = writeln!(f, "ro.build.type=userdebug");
         }
     }
     let mut log = File::create(SCRIPT_LOG).with_context(|| format!("create {SCRIPT_LOG}"))?;

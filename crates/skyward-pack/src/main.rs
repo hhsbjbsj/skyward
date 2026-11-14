@@ -284,9 +284,7 @@ fn patch_props(rd: &mut Ramdisk, cfg: &skyward_config::DeviceConfig) -> Result<(
         patched.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\n");
         rd.replace(SECURE_PROP, patched)?;
     }
-    if rd.find("default.prop").is_none() {
-        rd.link("default.prop", target)?;
-    }
+    rd.replace_or_add("default.prop", 0o644, props)?;
     Ok(())
 }
 
