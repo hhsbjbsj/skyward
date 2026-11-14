@@ -650,11 +650,14 @@ fn mount_firmware(partition: &str) -> Result<()> {
 }
 
 /// What the phone's own secure services read to tell the secure world which
-/// build is running: the system's version and patch level, and the vendor
-/// partition's patch level. A recovery image carries its own, older build's
-/// values; the secure world then sees keys the installed system made as
-/// made under a build it does not know, and refuses them. The recovery's
-/// property files leave these out so that they can be set here instead.
+/// build is running: the system's version, SDK and patch level, and the
+/// vendor partition's patch level. A recovery image carries its own, older
+/// build's values; the secure world then sees keys the installed system made
+/// as made under a build it does not know, and refuses them. ColorOS leaves
+/// the SDK out of the recovery entirely, because its property file points at
+/// `/cache/runtime.prop` and at `/system_root`, which is not mounted yet.
+/// The recovery's property files leave these out so that they can be set
+/// here instead.
 #[cfg(target_os = "android")]
 const BUILD_VERSION: [&str; 3] = ["ro.build.version.release", "ro.build.version.security_patch", "ro.vendor.build.security_patch"];
 
@@ -675,6 +678,15 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
     let name = "ro.vndk.version";
     if let Some(value) = props.get(name) {
         if skyward_sys::prop(name).is_none() {
+            skyward_sys::set_prop(name, value)?;
+        }
+        skyward_sys::kmsg(&format!("{name} is the installed system's {value}"))?;
+    }
+    // The service directory numbers its methods from this. ColorOS recovery
+    // never publishes it; the installed system does.
+    let name = "ro.build.version.sdk";
+    if let Some(value) = props.get(name) {
+        if skyward_sys::prop(name).as_ref() != Some(value) {
             skyward_sys::set_prop(name, value)?;
         }
         skyward_sys::kmsg(&format!("{name} is the installed system's {value}"))?;

@@ -43,7 +43,14 @@ fn methods_of(sdk: u32) -> Methods {
 const SDK: &str = "ro.build.version.sdk";
 
 fn methods() -> Result<Methods> {
-    let sdk = skyward_sys::prop(SDK).with_context(|| format!("the recovery says no {SDK}"))?;
+    // ColorOS recovery names no SDK of its own. `prop.default` points at
+    // `/cache/runtime.prop`, and `system/build.prop` at `/system_root`,
+    // which init has not mounted when the directory is first used. That
+    // recovery's directory is the one from before Android 16. A recovery
+    // that does name an SDK, as the 17 Ultra's does, keeps that numbering.
+    let Some(sdk) = skyward_sys::prop(SDK) else {
+        return Ok(methods_of(0));
+    };
     Ok(methods_of(sdk.parse().with_context(|| format!("{SDK} is {sdk:?}"))?))
 }
 
@@ -151,5 +158,10 @@ mod tests {
         assert_eq!(methods_of(35), methods_of(33));
         assert_eq!(methods_of(36), Methods { check_service: 3, list_services: 6, is_declared: 9 }, "the 17 Ultra's recovery");
         assert_eq!(methods_of(37), methods_of(36));
+    }
+
+    #[test]
+    fn a_recovery_that_names_no_sdk_uses_the_directory_from_before_android_16() {
+        assert_eq!(methods().unwrap(), methods_of(0));
     }
 }
