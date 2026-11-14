@@ -146,10 +146,10 @@ const NORMAL_MAX: [(&str, &str); 3] = [
 fn write_display(writes: &[skyward_config::Write]) {
     for w in writes {
         let path = Path::new(&w.path);
-        if path.exists() {
-            if let Err(e) = fs::write(path, &w.value) {
-                let _ = skyward_sys::kmsg(&format!("display: failed to write {}: {e}", w.path));
-            }
+        if path.exists()
+            && let Err(e) = fs::write(path, &w.value)
+        {
+            let _ = skyward_sys::kmsg(&format!("display: failed to write {}: {e}", w.path));
         }
     }
 }
