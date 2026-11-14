@@ -4,6 +4,7 @@
 //! what it opens holds every file, with the names and contents of the ones
 //! that are a user's own still encrypted.
 
+use crate::encryption::{key_dir, target, Encryption};
 use crate::gatekeeper::Gatekeeper;
 use crate::keystore::{StoredKey, Unwrap};
 use crate::token::Token;
@@ -30,8 +31,6 @@ pub const SDCARD: &str = "/sdcard";
 
 /// The phone's owner, the first of its users.
 const OWNER: u32 = 0;
-
-pub use crate::encryption::{key_dir, target, Encryption};
 
 /// Unwrap the key the phone keeps for its data partition and give the
 /// storage hardware the form of it that lasts until the phone is started
@@ -591,60 +590,4 @@ fn secret_note(user: u32, synthetic_password: &[u8]) -> Result<Note> {
         Ok(token) => Note { token: Some(token), refused: None },
         Err(e) => Note { token: None, refused: Some(format!("{e:#}")) },
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn entry(extras: &str) -> Entry {
-        Entry {
-            device: "/dev/block/bootdevice/by-name/userdata".into(),
-            mount_point: MOUNT.into(),
-            filesystem: "f2fs".into(),
-            options: vec!["noatime".into(), "inlinecrypt".into()],
-            extras: extras.split(',').map(str::to_string).collect(),
-        }
-    }
-
-    #[test]
-    fn the_phones_own_words_for_the_cipher_become_the_kernels() {
-        let e = entry("metadata_encryption=aes-256-xts:wrappedkey_v0,keydirectory=/metadata/vold/metadata_encryption");
-        assert_eq!(Encryption::of(&e).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true }));
-        let plain = entry("metadata_encryption=adiantum");
-        assert_eq!(Encryption::of(&plain).unwrap(), Some(Encryption { cipher: "xchacha12,aes-adiantum-plain64".into(), wrapped: false }));
-        let coloros = entry("metadata_encryption=wrappedkey_v0,fileencryption=ice:wrappedkey_v0,keydirectory=/metadata/vold/metadata_encryption");
-        assert_eq!(Encryption::of(&coloros).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true }));
-        let omitted = entry("metadata_encryption=:wrappedkey_v0");
-        assert_eq!(Encryption::of(&omitted).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true }));
-        let implied = entry("keydirectory=/metadata/vold/metadata_encryption,fileencryption=ice:wrappedkey_v0");
-        assert_eq!(Encryption::of(&implied).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true }));
-        let software = entry("keydirectory=/metadata/vold/metadata_encryption,fileencryption=aes-256-xts:aes-256-cts:v1");
-        assert_eq!(Encryption::of(&software).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: false }));
-    }
-
-    #[test]
-    fn absent_or_unknown_encryption_behaves_as_expected() {
-        assert_eq!(Encryption::of(&entry("quota")).unwrap(), None);
-        assert!(Encryption::of(&entry("metadata_encryption=rot13")).is_err());
-        assert!(key_dir(&entry("quota")).is_err());
-    }
-
-    #[test]
-    fn the_key_is_in_a_directory_under_the_one_the_phone_names() {
-        let e = entry("keydirectory=/metadata/vold/metadata_encryption");
-        assert_eq!(key_dir(&e).unwrap(), Path::new("/metadata/vold/metadata_encryption/key"));
-    }
-
-    #[test]
-    fn the_partition_is_mapped_in_whole_units_of_the_hardwares_reads() {
-        let e = Encryption { cipher: "aes-xts-plain64".into(), wrapped: true };
-        let t = target("/dev/block/by-name/userdata", 969_825_751, &[0xAB, 0x01], &e);
-        let Target::DefaultKey { sectors, key, cipher, device, wrapped } = t else { panic!("a decrypting target") };
-        assert_eq!(sectors, 969_825_744, "a whole number of 4096-byte units");
-        assert_eq!(key, "ab01");
-        assert_eq!(cipher, "aes-xts-plain64");
-        assert_eq!(device, "/dev/block/by-name/userdata");
-        assert!(wrapped);
-    }
 }

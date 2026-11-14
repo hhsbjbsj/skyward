@@ -98,8 +98,14 @@ mod tests {
         assert_eq!(Encryption::of(&e).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true }));
         let plain = entry("metadata_encryption=adiantum");
         assert_eq!(Encryption::of(&plain).unwrap(), Some(Encryption { cipher: "xchacha12,aes-adiantum-plain64".into(), wrapped: false }));
-        let coloros = entry("metadata_encryption=wrappedkey_v0,keydirectory=/metadata/vold/metadata_encryption");
+        let coloros = entry("metadata_encryption=wrappedkey_v0,fileencryption=ice:wrappedkey_v0,keydirectory=/metadata/vold/metadata_encryption");
         assert_eq!(Encryption::of(&coloros).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true }));
+        let omitted = entry("metadata_encryption=:wrappedkey_v0");
+        assert_eq!(Encryption::of(&omitted).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true }));
+        let implied = entry("keydirectory=/metadata/vold/metadata_encryption,fileencryption=ice:wrappedkey_v0");
+        assert_eq!(Encryption::of(&implied).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true }));
+        let software = entry("keydirectory=/metadata/vold/metadata_encryption,fileencryption=aes-256-xts:aes-256-cts:v1");
+        assert_eq!(Encryption::of(&software).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: false }));
     }
 
     #[test]
