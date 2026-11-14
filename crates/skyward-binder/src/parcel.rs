@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 /// The mark libbinder writes into every call header. Both ends have to agree
 /// on it: it tells apart the copies of libbinder a phone carries. Android 13
@@ -21,6 +22,39 @@ fn header_for(sdk: Option<u32>) -> i32 {
         HEADER_RECOVERY
     } else {
         HEADER_SYSTEM
+    }
+}
+
+/// `0` until a directory has accepted one mark. Neither mark is zero.
+static CHOSEN_HEADER: AtomicI32 = AtomicI32::new(0);
+
+fn sdk_of_prop() -> Option<u32> {
+    skyward_sys::prop("ro.build.version.sdk").and_then(|s| s.parse().ok())
+}
+
+/// The mark the next call carries: the one a directory already accepted, or
+/// the one `ro.build.version.sdk` suggests when none has answered yet.
+pub(crate) fn current_header() -> i32 {
+    match CHOSEN_HEADER.load(Ordering::Relaxed) {
+        0 => header_for(sdk_of_prop()),
+        chosen => chosen,
+    }
+}
+
+/// Remember the mark a directory accepted, so later calls use it too.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn select_header(header: i32) {
+    CHOSEN_HEADER.store(header, Ordering::Relaxed);
+}
+
+/// The mark this one is not. A directory that refuses one was built with the
+/// other: Android 16's system copy reads `SYST`, a recovery copy from
+/// Android 13 on reads `RECO`.
+pub(crate) fn alternate_header(header: i32) -> i32 {
+    if header == HEADER_RECOVERY {
+        HEADER_SYSTEM
+    } else {
+        HEADER_RECOVERY
     }
 }
 
@@ -70,17 +104,20 @@ impl Parcel {
     /// 13 on, the system mark before that and when the recovery names no
     /// version. The installed system's SDK is a different program.
     pub fn call(interface: &str) -> Parcel {
-        let sdk = skyward_sys::prop("ro.build.version.sdk").and_then(|s| s.parse().ok());
-        Self::call_for(interface, sdk)
+        Self::call_with(interface, current_header())
     }
 
-    fn call_for(interface: &str, sdk: Option<u32>) -> Parcel {
+    pub(crate) fn call_with(interface: &str, header: i32) -> Parcel {
         let mut p = Parcel::default();
         p.i32(STRICT_MODE_PENALTY_GATHER);
         p.i32(UNSET_WORK_SOURCE);
-        p.i32(header_for(sdk));
+        p.i32(header);
         p.string(interface);
         p
+    }
+
+    fn call_for(interface: &str, sdk: Option<u32>) -> Parcel {
+        Self::call_with(interface, header_for(sdk))
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -286,6 +323,12 @@ mod tests {
         for sdk in [Some(33u32), Some(34), Some(36)] {
             assert_eq!(header_of(sdk), 0x5245_434f, "the recovery mark, RECO, for {sdk:?}");
         }
+    }
+
+    #[test]
+    fn the_other_mark_is_the_one_this_directory_did_not_read() {
+        assert_eq!(alternate_header(0x5245_434f), 0x5359_5354, "RECO refused, so SYST");
+        assert_eq!(alternate_header(0x5359_5354), 0x5245_434f, "SYST refused, so RECO");
     }
 
     #[test]
