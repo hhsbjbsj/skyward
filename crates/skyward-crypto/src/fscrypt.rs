@@ -93,6 +93,23 @@ fn add_legacy_v1_key(raw: &[u8], desc: &[u8; V1_NAME_BYTES]) -> Result<()> {
 /// return the key descriptor (8 bytes for v1) or identifier (16 bytes for v2).
 #[cfg(target_os = "android")]
 pub fn install_key(mount: &Path, raw: &[u8], policy: Policy, wrapped: bool) -> Result<Vec<u8>> {
+    install_key_explicit(mount, raw, policy, wrapped, None)
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn install_key(_mount: &Path, _raw: &[u8], _policy: Policy, _wrapped: bool) -> Result<Vec<u8>> {
+    anyhow::bail!("only supported on Android")
+}
+
+/// Like [`install_key`], but allowing an explicit descriptor for v1 policies.
+#[cfg(target_os = "android")]
+pub fn install_key_explicit(
+    mount: &Path,
+    raw: &[u8],
+    policy: Policy,
+    wrapped: bool,
+    explicit_desc: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     use std::os::fd::AsRawFd;
     const HEADER_BYTES: usize = 80;
     const BY_DESCRIPTOR: u32 = 1;
@@ -103,7 +120,14 @@ pub fn install_key(mount: &Path, raw: &[u8], policy: Policy, wrapped: bool) -> R
     let mut arg = vec![0u8; HEADER_BYTES + raw.len()];
     let desc = match policy {
         Policy::V1 => {
-            let desc = v1_descriptor(raw);
+            let desc = match explicit_desc {
+                Some(d) if d.len() == V1_NAME_BYTES => {
+                    let mut arr = [0u8; V1_NAME_BYTES];
+                    arr.copy_from_slice(d);
+                    arr
+                }
+                _ => v1_descriptor(raw),
+            };
             arg[0..4].copy_from_slice(&BY_DESCRIPTOR.to_ne_bytes());
             arg[8..8 + V1_NAME_BYTES].copy_from_slice(&desc);
             Some(desc)
@@ -134,6 +158,47 @@ pub fn install_key(mount: &Path, raw: &[u8], policy: Policy, wrapped: bool) -> R
         Policy::V1 => desc.expect("v1 descriptor").to_vec(),
         Policy::V2 => arg[8..8 + NAME_BYTES].to_vec(),
     })
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn install_key_explicit(
+    _mount: &Path,
+    _raw: &[u8],
+    _policy: Policy,
+    _wrapped: bool,
+    _explicit_desc: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    anyhow::bail!("only supported on Android")
+}
+
+/// Query the 8-byte v1 encryption key descriptor of the filesystem directory at `dir`,
+/// if it is encrypted with a v1 fscrypt policy.
+#[cfg(target_os = "android")]
+pub fn policy_descriptor(dir: &Path) -> Option<[u8; V1_NAME_BYTES]> {
+    use std::os::fd::AsRawFd;
+    const GET_POLICY_V1: u32 = 0x400c_6615;
+    const GET_POLICY: u32 = 0xc009_6616;
+    const POLICY_BYTES: usize = 24;
+
+    let folder = std::fs::File::open(dir).ok()?;
+    let mut policy = [0u8; 8 + POLICY_BYTES];
+    policy[..8].copy_from_slice(&(POLICY_BYTES as u64).to_ne_bytes());
+    if unsafe { libc::ioctl(folder.as_raw_fd(), GET_POLICY as libc::Ioctl, policy.as_mut_ptr()) } == 0 {
+        if policy[8] == 0 {
+            return policy[12..20].try_into().ok();
+        }
+    } else {
+        let mut v1 = [0u8; 12];
+        if unsafe { libc::ioctl(folder.as_raw_fd(), GET_POLICY_V1 as libc::Ioctl, v1.as_mut_ptr()) } == 0 {
+            return v1[4..12].try_into().ok();
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn policy_descriptor(_dir: &Path) -> Option<[u8; V1_NAME_BYTES]> {
+    None
 }
 
 /// Let `raw` into the filesystem mounted at `mount` using a v2 policy

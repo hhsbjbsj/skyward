@@ -330,24 +330,29 @@ fn open_shared(service: &KeyService) -> Result<Vec<u8>> {
     let policy = crate::fscrypt::Policy::of(mode.trim());
     let wrapped = file_keys_wrapped(mode.trim());
     let raw = hardware_key(service, Path::new(SHARED_KEY), wrapped)?;
-    let name = crate::fscrypt::install_key(Path::new(MOUNT), &raw, policy, wrapped)?;
     let recorded = crate::fscrypt::recorded_ref(Path::new(SHARED_NAME), policy)?;
-    if name != recorded {
-        anyhow::bail!("the key in {SHARED_KEY} is not the one {SHARED_NAME} names");
-    }
-    Ok(name)
+    let explicit = crate::fscrypt::install_key_explicit(Path::new(MOUNT), &raw, policy, wrapped, Some(&recorded))?;
+    let default = crate::fscrypt::install_key(Path::new(MOUNT), &raw, policy, wrapped);
+    skyward_sys::kmsg(&format!("shared key installed: recorded={:02x?}, default={:02x?}", explicit, default))?;
+    Ok(explicit)
 }
 
 /// Which users the phone keeps keys for, in order.
 fn users() -> Result<Vec<u32>> {
     let dir = Path::new(USER_KEYS).join("de");
     let mut users = Vec::new();
-    for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
-        let path = entry.with_context(|| format!("read {}", dir.display()))?.path();
-        let Some(user) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse::<u32>().ok()) else { continue };
-        users.push(user);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(user) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse::<u32>().ok()) else { continue };
+            users.push(user);
+        }
+    }
+    if users.is_empty() && (Path::new(PROTECTORS).join("0").exists() || Path::new("/data/user_de/0").exists()) {
+        users.push(0);
     }
     users.sort_unstable();
+    users.dedup();
     Ok(users)
 }
 
@@ -360,8 +365,22 @@ fn open_users(service: &KeyService) -> Result<Vec<u32>> {
     let users = users()?;
     for user in &users {
         let dir = Path::new(USER_KEYS).join("de").join(user.to_string());
+        if !dir.exists() {
+            continue;
+        }
         let raw = hardware_key(service, &dir, wrapped)?;
-        crate::fscrypt::install_key(Path::new(MOUNT), &raw, policy, wrapped)?;
+        let mut desc = dir.join("ref").is_file().then(|| std::fs::read(dir.join("ref")).ok()).flatten();
+        if desc.is_none() {
+            let target = Path::new(PROTECTORS).join(user.to_string());
+            desc = crate::fscrypt::policy_descriptor(&target).map(|d| d.to_vec());
+        }
+        if desc.is_none() {
+            let target = Path::new("/data/user_de").join(user.to_string());
+            desc = crate::fscrypt::policy_descriptor(&target).map(|d| d.to_vec());
+        }
+        let explicit = crate::fscrypt::install_key_explicit(Path::new(MOUNT), &raw, policy, wrapped, desc.as_deref())?;
+        let _ = crate::fscrypt::install_key(Path::new(MOUNT), &raw, policy, wrapped);
+        skyward_sys::kmsg(&format!("user {user} DE key installed: desc={:02x?}", explicit))?;
     }
     Ok(users)
 }
@@ -583,7 +602,18 @@ fn open_user_files(service: &KeyService, user: u32, credential: Option<&[u8]>, o
         true => service.ephemeral_storage_key(&raw).with_context(|| format!("make the key in {} usable now", dir.display()))?,
         false => raw,
     };
-    crate::fscrypt::install_key(Path::new(MOUNT), &raw, policy, wrapped)?;
+    let mut desc = dir.join("ref").is_file().then(|| std::fs::read(dir.join("ref")).ok()).flatten();
+    if desc.is_none() {
+        let target = Path::new("/data/system_ce").join(user.to_string());
+        desc = crate::fscrypt::policy_descriptor(&target).map(|d| d.to_vec());
+    }
+    if desc.is_none() {
+        let target = Path::new("/data/user").join(user.to_string());
+        desc = crate::fscrypt::policy_descriptor(&target).map(|d| d.to_vec());
+    }
+    let explicit = crate::fscrypt::install_key_explicit(Path::new(MOUNT), &raw, policy, wrapped, desc.as_deref())?;
+    let _ = crate::fscrypt::install_key(Path::new(MOUNT), &raw, policy, wrapped);
+    skyward_sys::kmsg(&format!("user {user} CE key installed: desc={:02x?}", explicit))?;
     if user == OWNER {
         show_owner_storage()?;
     }
