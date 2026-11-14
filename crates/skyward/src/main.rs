@@ -682,14 +682,17 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
         }
         skyward_sys::kmsg(&format!("{name} is the installed system's {value}"))?;
     }
-    // The service directory numbers its methods from this. ColorOS recovery
-    // never publishes it; the installed system does.
+    // The service directory is the recovery ramdisk's own program, and both
+    // the mark on a call and the numbers of its methods are the ones that
+    // program was built with. ColorOS names no SDK, which is that directory
+    // from before Android 13. The installed system must not be copied over
+    // it: Android 16 would mark every call as the recovery's, and this
+    // directory turns such a call away before it says whether KeyMint is
+    // described.
     let name = "ro.build.version.sdk";
-    if let Some(value) = props.get(name) {
-        if skyward_sys::prop(name).as_ref() != Some(value) {
-            skyward_sys::set_prop(name, value)?;
-        }
-        skyward_sys::kmsg(&format!("{name} is the installed system's {value}"))?;
+    match skyward_sys::prop(name) {
+        Some(value) => skyward_sys::kmsg(&format!("{name} stays the recovery's own {value}"))?,
+        None => skyward_sys::kmsg(&format!("{name} stays unset, so the directory is the one from before Android 13"))?,
     }
     Ok(())
 }

@@ -65,9 +65,10 @@ impl Payload for Parcel {
 impl Parcel {
     /// A call to `interface`, opened with the header libbinder reads before
     /// it looks at anything the method itself takes. The mark is the one the
-    /// recovery's own libbinder was built with, which `ro.build.version.sdk`
-    /// says: the recovery mark from Android 13 on, the system mark before
-    /// that and when the recovery names no version.
+    /// recovery's own directory was built with, which `ro.build.version.sdk`
+    /// says when that directory published it: the recovery mark from Android
+    /// 13 on, the system mark before that and when the recovery names no
+    /// version. The installed system's SDK is a different program.
     pub fn call(interface: &str) -> Parcel {
         let sdk = skyward_sys::prop("ro.build.version.sdk").and_then(|s| s.parse().ok());
         Self::call_for(interface, sdk)
