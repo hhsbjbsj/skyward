@@ -1,9 +1,63 @@
 use anyhow::{bail, Context, Result};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 /// The mark libbinder writes into every call header. Both ends have to agree
-/// on it: it tells apart the copies of libbinder a phone carries, and the one
-/// the recovery's own programs are built from is the recovery copy.
-const HEADER: i32 = i32::from_be_bytes(*b"RECO");
+/// on it: it tells apart the copies of libbinder a phone carries. Android 13
+/// and later build the recovery's own copy with the recovery mark. Android 11
+/// and 12, ColorOS 11 among them, build that same recovery copy with the
+/// system mark, and a call that carries the other one is turned away as the
+/// wrong type before the method is read.
+const HEADER_RECOVERY: i32 = i32::from_be_bytes(*b"RECO");
+const HEADER_SYSTEM: i32 = i32::from_be_bytes(*b"SYST");
+
+/// The first Android version whose recovery libbinder expects the recovery
+/// mark. Everything older expects the system mark, and so does a recovery
+/// that has not said which version it is.
+const RECOVERY_HEADER_SDK: u32 = 33;
+
+/// Which mark a recovery built as Android version `sdk` writes. `None` is a
+/// recovery that names no version, which on this path is the older mark.
+fn header_for(sdk: Option<u32>) -> i32 {
+    if sdk.is_some_and(|sdk| sdk >= RECOVERY_HEADER_SDK) {
+        HEADER_RECOVERY
+    } else {
+        HEADER_SYSTEM
+    }
+}
+
+/// `0` until a directory has accepted one mark. Neither mark is zero.
+static CHOSEN_HEADER: AtomicI32 = AtomicI32::new(0);
+
+fn sdk_of_prop() -> Option<u32> {
+    skyward_sys::prop("ro.build.version.sdk").and_then(|s| s.parse().ok())
+}
+
+/// The mark the next call carries: the one a directory already accepted, or
+/// the one `ro.build.version.sdk` suggests when none has answered yet.
+pub(crate) fn current_header() -> i32 {
+    match CHOSEN_HEADER.load(Ordering::Relaxed) {
+        0 => header_for(sdk_of_prop()),
+        chosen => chosen,
+    }
+}
+
+/// Remember the mark a directory accepted, so later calls use it too.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn select_header(header: i32) {
+    CHOSEN_HEADER.store(header, Ordering::Relaxed);
+}
+
+/// The mark this one is not. A directory that refuses one was built with the
+/// other: Android 16's system copy reads `SYST`, a recovery copy from
+/// Android 13 on reads `RECO`.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn alternate_header(header: i32) -> i32 {
+    if header == HEADER_RECOVERY {
+        HEADER_SYSTEM
+    } else {
+        HEADER_RECOVERY
+    }
+}
 
 /// Strict mode gathers violations rather than acting on them; a caller with
 /// no policy of its own still sets that bit.
@@ -45,14 +99,27 @@ impl Payload for Parcel {
 
 impl Parcel {
     /// A call to `interface`, opened with the header libbinder reads before
-    /// it looks at anything the method itself takes.
+    /// it looks at anything the method itself takes. The mark is the one the
+    /// recovery's own directory was built with, which `ro.build.version.sdk`
+    /// says when that directory published it: the recovery mark from Android
+    /// 13 on, the system mark before that and when the recovery names no
+    /// version. The installed system's SDK is a different program.
     pub fn call(interface: &str) -> Parcel {
+        Self::call_with(interface, current_header())
+    }
+
+    pub(crate) fn call_with(interface: &str, header: i32) -> Parcel {
         let mut p = Parcel::default();
         p.i32(STRICT_MODE_PENALTY_GATHER);
         p.i32(UNSET_WORK_SOURCE);
-        p.i32(HEADER);
+        p.i32(header);
         p.string(interface);
         p
+    }
+
+    #[cfg(test)]
+    fn call_for(interface: &str, sdk: Option<u32>) -> Parcel {
+        Self::call_with(interface, header_for(sdk))
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -230,15 +297,49 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_call_opens_with_the_header_and_the_interface_name() {
-        let p = Parcel::call("a.b.IC");
+    fn header_of(sdk: Option<u32>) -> i32 {
+        let p = Parcel::call_for("a.b.IC", sdk);
         let mut r = Reader::new(p.bytes());
         assert_eq!(r.i32().unwrap(), i32::MIN, "strict mode gathers");
         assert_eq!(r.i32().unwrap(), -1, "no work source");
-        assert_eq!(r.i32().unwrap(), 0x5245_434f, "the recovery's mark, RECO");
+        let header = r.i32().unwrap();
         assert_eq!(r.string().unwrap(), "a.b.IC");
         assert_eq!(r.here(), p.bytes().len(), "the header is all of it");
+        header
+    }
+
+    #[test]
+    fn a_call_opens_with_the_header_and_the_interface_name() {
+        assert_eq!(header_of(Some(33)), 0x5245_434f, "the recovery's mark, RECO");
+    }
+
+    #[test]
+    fn a_call_before_android_13_carries_the_system_mark() {
+        for sdk in [None, Some(0u32), Some(30), Some(32)] {
+            assert_eq!(header_of(sdk), 0x5359_5354, "the system mark, SYST, for {sdk:?}");
+        }
+    }
+
+    #[test]
+    fn a_call_from_android_13_on_carries_the_recovery_mark() {
+        for sdk in [Some(33u32), Some(34), Some(36)] {
+            assert_eq!(header_of(sdk), 0x5245_434f, "the recovery mark, RECO, for {sdk:?}");
+        }
+    }
+
+    #[test]
+    fn the_other_mark_is_the_one_this_directory_did_not_read() {
+        assert_eq!(alternate_header(0x5245_434f), 0x5359_5354, "RECO refused, so SYST");
+        assert_eq!(alternate_header(0x5359_5354), 0x5245_434f, "SYST refused, so RECO");
+    }
+
+    #[test]
+    fn a_recovery_that_names_no_sdk_writes_the_system_mark() {
+        let p = Parcel::call("a.b.IC");
+        let mut r = Reader::new(p.bytes());
+        r.i32().unwrap();
+        r.i32().unwrap();
+        assert_eq!(r.i32().unwrap(), 0x5359_5354, "no version named, so the system mark");
     }
 
     #[test]

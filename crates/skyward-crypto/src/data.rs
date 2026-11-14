@@ -54,16 +54,35 @@ impl Encryption {
     /// Read what an entry of the phone's own table says, or `None` when the
     /// phone does not use whole-partition metadata encryption.
     pub fn of(entry: &Entry) -> Result<Option<Encryption>> {
-        let Some(said) = entry.extra("metadata_encryption") else {
-            return Ok(None);
-        };
-        let (name, rest) = said.split_once(':').unwrap_or((said, ""));
-        let cipher = CIPHERS
-            .iter()
-            .find_map(|(theirs, kernels)| (*theirs == name).then_some(*kernels))
-            .with_context(|| format!("no cipher here is the {name} the phone names"))?;
-        Ok(Some(Encryption { cipher: cipher.to_string(), wrapped: rest == "wrappedkey_v0" }))
+        if let Some(said) = entry.extra("metadata_encryption") {
+            return Ok(Some(parse_metadata(said)?));
+        }
+        // Naming the key directory turns metadata encryption on. With no
+        // cipher written beside it, the default is AES-256-XTS. The files'
+        // own flag says whether that key is hardware-wrapped.
+        if entry.extra("keydirectory").is_some() {
+            let wrapped = entry.extra("fileencryption").is_some_and(crate::fscrypt::hardware_wrapped);
+            return Ok(Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped }));
+        }
+        Ok(None)
     }
+}
+
+/// The cipher and wrapped-key flag in a `metadata_encryption` value.
+/// `wrappedkey_v0` and `:wrappedkey_v0` name no cipher. AES-256-XTS is the
+/// default, and the key is one only the storage hardware unwraps. ColorOS
+/// on SM6125 writes the first of those.
+fn parse_metadata(said: &str) -> Result<Encryption> {
+    let (name, rest) = said.split_once(':').unwrap_or((said, ""));
+    if matches!((name, rest), ("wrappedkey_v0", "") | ("", "wrappedkey_v0")) {
+        return Ok(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true });
+    }
+    let shown = if name.is_empty() { said } else { name };
+    let cipher = CIPHERS
+        .iter()
+        .find_map(|(theirs, kernels)| (*theirs == name).then_some(*kernels))
+        .with_context(|| format!("no cipher here is the {shown} the phone names"))?;
+    Ok(Encryption { cipher: cipher.to_string(), wrapped: rest == "wrappedkey_v0" })
 }
 
 /// Where the phone keeps the key for the filesystem an entry describes.
@@ -282,6 +301,19 @@ fn made_up(user: u32, id: &str) -> bool {
     made_up_record(user, id).is_some()
 }
 
+/// Whether the keys of the files are ones only the storage hardware unwraps.
+/// `/data/unencrypted/mode` on ColorOS is often only `ice`. The phone's own
+/// table still says `fileencryption=ice:wrappedkey_v0`.
+fn file_keys_wrapped(mode: &str) -> bool {
+    if crate::fscrypt::hardware_wrapped(mode) {
+        return true;
+    }
+    let Ok(entries) = skyward_block::fstab::read(MOUNT) else {
+        return false;
+    };
+    entries.iter().any(|entry| entry.extra("fileencryption").is_some_and(crate::fscrypt::hardware_wrapped))
+}
+
 /// Where the phone keeps the key for the files that are readable before
 /// anyone signs in, and what it says about how those files are encrypted.
 const SHARED_KEY: &str = "/data/unencrypted/key";
@@ -296,7 +328,7 @@ const USER_KEYS: &str = "/data/misc/vold/user_keys";
 fn open_shared(service: &KeyService) -> Result<Vec<u8>> {
     let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
     let policy = crate::fscrypt::Policy::of(mode.trim());
-    let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
+    let wrapped = file_keys_wrapped(mode.trim());
     let raw = hardware_key(service, Path::new(SHARED_KEY), wrapped)?;
     let name = crate::fscrypt::install_key(Path::new(MOUNT), &raw, policy, wrapped)?;
     let recorded = crate::fscrypt::recorded_ref(Path::new(SHARED_NAME), policy)?;
@@ -324,7 +356,7 @@ fn users() -> Result<Vec<u32>> {
 fn open_users(service: &KeyService) -> Result<Vec<u32>> {
     let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
     let policy = crate::fscrypt::Policy::of(mode.trim());
-    let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
+    let wrapped = file_keys_wrapped(mode.trim());
     let users = users()?;
     for user in &users {
         let dir = Path::new(USER_KEYS).join("de").join(user.to_string());
@@ -541,7 +573,7 @@ fn open_user_files(service: &KeyService, user: u32, credential: Option<&[u8]>, o
 
     let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
     let policy = crate::fscrypt::Policy::of(mode.trim());
-    let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
+    let wrapped = file_keys_wrapped(mode.trim());
     let dir = Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current");
     let stored = StoredKey::load(&dir).with_context(|| format!("read the key in {}", dir.display()))?;
     let raw = stored
@@ -621,6 +653,14 @@ mod tests {
         assert_eq!(Encryption::of(&e).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true }));
         let plain = entry("metadata_encryption=adiantum");
         assert_eq!(Encryption::of(&plain).unwrap(), Some(Encryption { cipher: "xchacha12,aes-adiantum-plain64".into(), wrapped: false }));
+        let coloros = entry("metadata_encryption=wrappedkey_v0,fileencryption=ice:wrappedkey_v0,keydirectory=/metadata/vold/metadata_encryption");
+        assert_eq!(Encryption::of(&coloros).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true }));
+        let omitted = entry("metadata_encryption=:wrappedkey_v0");
+        assert_eq!(Encryption::of(&omitted).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true }));
+        let implied = entry("keydirectory=/metadata/vold/metadata_encryption,fileencryption=ice:wrappedkey_v0");
+        assert_eq!(Encryption::of(&implied).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true }));
+        let software = entry("keydirectory=/metadata/vold/metadata_encryption,fileencryption=aes-256-xts:aes-256-cts:v1");
+        assert_eq!(Encryption::of(&software).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: false }));
     }
 
     #[test]

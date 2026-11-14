@@ -653,11 +653,14 @@ fn mount_firmware(partition: &str) -> Result<()> {
 }
 
 /// What the phone's own secure services read to tell the secure world which
-/// build is running: the system's version and patch level, and the vendor
-/// partition's patch level. A recovery image carries its own, older build's
-/// values; the secure world then sees keys the installed system made as
-/// made under a build it does not know, and refuses them. The recovery's
-/// property files leave these out so that they can be set here instead.
+/// build is running: the system's version, SDK and patch level, and the
+/// vendor partition's patch level. A recovery image carries its own, older
+/// build's values; the secure world then sees keys the installed system made
+/// as made under a build it does not know, and refuses them. ColorOS leaves
+/// the SDK out of the recovery entirely, because its property file points at
+/// `/cache/runtime.prop` and at `/system_root`, which is not mounted yet.
+/// The recovery's property files leave these out so that they can be set
+/// here instead.
 #[cfg(target_os = "android")]
 const BUILD_VERSION: [&str; 3] = ["ro.build.version.release", "ro.build.version.security_patch", "ro.vendor.build.security_patch"];
 
@@ -682,6 +685,18 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
         }
         skyward_sys::kmsg(&format!("{name} is the installed system's {value}"))?;
     }
+    // The service directory is the recovery ramdisk's own program, and both
+    // the mark on a call and the numbers of its methods are the ones that
+    // program was built with. ColorOS names no SDK, which is that directory
+    // from before Android 13. The installed system must not be copied over
+    // it: Android 16 would mark every call as the recovery's, and this
+    // directory turns such a call away before it says whether KeyMint is
+    // described.
+    let name = "ro.build.version.sdk";
+    match skyward_sys::prop(name) {
+        Some(value) => skyward_sys::kmsg(&format!("{name} stays the recovery's own {value}"))?,
+        None => skyward_sys::kmsg(&format!("{name} stays unset, so the directory is the one from before Android 13"))?,
+    }
     Ok(())
 }
 
@@ -704,10 +719,16 @@ fn recovery() -> Result<()> {
         skyward_sys::keep_log(Path::new(skyward_sys::LOG))?;
         // A recovery that ended with a function of its own in the port took
         // the port with it; going through "none" takes that function off.
+        // The screen still comes up when the port does not answer in time,
+        // so a failure goes to the kernel log.
         if skyward_sys::prop("sys.usb.state").is_some_and(|s| s != "adb") {
-            skyward_sys::usb::set("none", std::time::Duration::from_secs(5))?;
+            if let Err(e) = skyward_sys::usb::set("none", std::time::Duration::from_secs(5)) {
+                skyward_sys::kmsg(&format!("the USB port did not go to none: {e:#}"))?;
+            }
         }
-        skyward_sys::set_prop("sys.usb.config", "adb")?;
+        if let Err(e) = skyward_sys::set_prop("sys.usb.config", "adb") {
+            skyward_sys::kmsg(&format!("adb was not asked for: {e:#}"))?;
+        }
         let misc = bcb::misc();
         let message = bcb::read(&misc)?;
         let request = message.request();
