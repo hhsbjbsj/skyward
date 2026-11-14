@@ -356,7 +356,7 @@ fn main() -> Result<()> {
                 let held = if sqlite.exists() {
                     skyward_crypto::keystore2::key_blob(sqlite, &alias)?
                 } else {
-                    skyward_crypto::keystore1::key_blob(Path::new(skyward_crypto::keystore1::USER_0), &alias)?
+                    skyward_crypto::keystore1::key_blob(Path::new(skyward_crypto::keystore1::DIRECTORY), 0, &alias)?
                 };
                 println!("{alias} is a key of {} bytes", held.len());
                 for (tag, value) in service.authorizations(&held, &[])? {

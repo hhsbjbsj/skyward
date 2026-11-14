@@ -11,13 +11,11 @@ mod described;
 
 use skyward_bootimg::{BootImage, Compression, Ramdisk};
 
-impl From<skyward_config::RamdiskCompression> for Compression {
-    fn from(c: skyward_config::RamdiskCompression) -> Self {
-        match c {
-            skyward_config::RamdiskCompression::Lz4 => Compression::Lz4,
-            skyward_config::RamdiskCompression::Gzip => Compression::Gzip,
-            skyward_config::RamdiskCompression::Lzma => Compression::Lzma,
-        }
+fn to_compression(c: skyward_config::RamdiskCompression) -> Compression {
+    match c {
+        skyward_config::RamdiskCompression::Lz4 => Compression::Lz4Legacy,
+        skyward_config::RamdiskCompression::Gzip => Compression::Gzip,
+        skyward_config::RamdiskCompression::Lzma => Compression::Lzma,
     }
 }
 
@@ -180,7 +178,7 @@ fn main() -> Result<()> {
             patch_props(&mut rd, &cfg)?;
             disable_init_services(&mut rd, &cfg.services, stock.map_or(&[][..], |s| s.disable_services.as_slice()))?;
             let compression = stock
-                .and_then(|s| s.ramdisk_compression.map(Compression::from))
+                .and_then(|s| s.ramdisk_compression.map(to_compression))
                 .unwrap_or_else(|| Compression::of(&img.ramdisk));
             img.ramdisk = rd.encode_as(compression)?;
             let bytes = img.to_bytes()?;
