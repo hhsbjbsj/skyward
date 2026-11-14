@@ -289,7 +289,8 @@ mod tests {
 
     #[test]
     fn a_recovery_that_names_no_sdk_writes_the_system_mark() {
-        let mut r = Reader::new(Parcel::call("a.b.IC").bytes());
+        let p = Parcel::call("a.b.IC");
+        let mut r = Reader::new(p.bytes());
         r.i32().unwrap();
         r.i32().unwrap();
         assert_eq!(r.i32().unwrap(), 0x5359_5354, "no version named, so the system mark");
