@@ -1547,8 +1547,7 @@ impl<'a> Pages<'a> {
             && !self.sideloading
             && let Err(e) = skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)
         {
-            skyward_sys::kmsg(&format!("the port did not take file transfer: {e:#}"))?;
-            self.app.report(&format!("{e:#}"), monotonic_ms());
+            self.revert_transfer_to_adb(&e, true, monotonic_ms())?;
         }
         if let Some(slot) = self.info.slot {
             let standing = skyward_vab::standing(slot)?;
@@ -3026,8 +3025,7 @@ impl Pages<'_> {
                     if rests
                         && let Err(e) = skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)
                     {
-                        skyward_sys::kmsg(&format!("the port did not take file transfer: {e:#}"))?;
-                        self.app.report(&format!("{e:#}"), now);
+                        self.revert_transfer_to_adb(&e, true, now)?;
                     }
                 }
                 Err(e) => {
@@ -3043,6 +3041,19 @@ impl Pages<'_> {
             }
             (on, t) => unreachable!("the switch turned file transfer {on} while it was {}", t.is_some()),
         }
+        Ok(())
+    }
+
+    /// Tear down file transfer and switch the port back to adb alone if
+    /// switching to MTP timed out, so adb does not stay stranded in `"none"`.
+    fn revert_transfer_to_adb(&mut self, err: &anyhow::Error, rests: bool, now: u64) -> Result<()> {
+        skyward_sys::kmsg(&format!("the port did not take file transfer: {err:#}"))?;
+        if let Some(t) = self.transfer.take()
+            && let Err(stop_err) = t.stop(rests)
+        {
+            skyward_sys::kmsg(&format!("adb fallback after file transfer failure failed: {stop_err:#}"))?;
+        }
+        self.app.file_transfer_failed(false, &skyward_ui::fmt::transfer_failed(self.app.state.lang, &format!("{err:#}")), now);
         Ok(())
     }
 }
