@@ -513,7 +513,7 @@ fn bring_up(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>) -> Result<()> {
     // The drivers ask for their firmware by name, and the kernel looks only
     // in folders of its own unless told to pass on what it does not find
     // there to ueventd, which looks in the recovery's firmware folders.
-    std::fs::write(FIRMWARE_FALLBACK, "1").with_context(|| format!("write 1 to {FIRMWARE_FALLBACK}"))?;
+    let _ = std::fs::write(FIRMWARE_FALLBACK, "1");
     if let Some(firmware) = &cfg.firmware {
         mount_firmware(&firmware.partition)?;
     }

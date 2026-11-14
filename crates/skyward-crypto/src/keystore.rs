@@ -81,7 +81,10 @@ impl StoredKey {
             false => Vec::new(),
         };
         let key_blob = match dir.join(FN_KEY_BLOB).exists() {
-            true => Some(read(FN_KEY_BLOB)?),
+            true => {
+                let raw = read(FN_KEY_BLOB)?;
+                Some(crate::keymaster4::strip_km_compat_prefix(&raw).to_vec())
+            }
             false => None,
         };
         Ok(StoredKey { encrypted: read(FN_ENCRYPTED_KEY)?, key_blob, secdiscardable_hash })

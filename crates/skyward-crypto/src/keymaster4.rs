@@ -31,6 +31,24 @@ const KEY_FORMAT_RAW: u32 = 3;
 const KEY_REQUIRES_UPGRADE: i32 = -62;
 const NONCE_BYTES: usize = 12;
 
+/// Magic marker and prefix size used by Android's keystore2 km_compat layer
+/// (Android 12+) when wrapping Keymaster 4.0 key blobs.
+pub const KM_COMPAT_MAGIC: &[u8; 7] = b"pKMblob";
+pub const KM_COMPAT_PREFIX_LEN: usize = 8;
+
+/// Strip keystore2's `pKMblob\0` or `pKMblob\1` prefix if present, returning the
+/// underlying raw Keymaster key blob.
+pub fn strip_km_compat_prefix(blob: &[u8]) -> &[u8] {
+    if blob.len() >= KM_COMPAT_PREFIX_LEN
+        && &blob[..7] == KM_COMPAT_MAGIC
+        && (blob[7] == 0 || blob[7] == 1)
+    {
+        &blob[KM_COMPAT_PREFIX_LEN..]
+    } else {
+        blob
+    }
+}
+
 const PURPOSE_DECRYPT: i32 = 1;
 const BLOCK_MODE_GCM: i64 = 32;
 const PADDING_NONE: i64 = 1;
@@ -279,6 +297,7 @@ impl<'a> Keymaster4<'a> {
     }
 
     fn export_raw(&self, key: &[u8]) -> std::result::Result<Vec<u8>, KmError> {
+        let key = strip_km_compat_prefix(key);
         let mut call = Message::call(SERVICE);
         call.u32(KEY_FORMAT_RAW);
         call.bytes(key);
@@ -293,6 +312,7 @@ impl<'a> Keymaster4<'a> {
     }
 
     pub fn authorizations(&self, key_blob: &[u8], app_id: &[u8]) -> Result<Vec<(i32, i64)>> {
+        let key_blob = strip_km_compat_prefix(key_blob);
         let mut call = Message::call(SERVICE);
         call.bytes(key_blob);
         call.bytes(app_id);
@@ -338,6 +358,7 @@ impl<'a> Keymaster4<'a> {
     }
 
     fn begin(&self, key_blob: &[u8], app_id: &[u8], nonce: &[u8], note: Option<&Token>) -> std::result::Result<u64, KmError> {
+        let key_blob = strip_km_compat_prefix(key_blob);
         let call = ask_begin(key_blob, app_id, nonce, note);
         let reply = self.device.transact(BEGIN, &call).map_err(|e| KmError { code: -1, context: format!("start a decryption: {e:#}") })?;
         let mut answer = Answer::new(reply.bytes());
@@ -349,6 +370,7 @@ impl<'a> Keymaster4<'a> {
     }
 
     fn upgrade(&self, key_blob: &[u8], params: &[Param<'_>]) -> Result<Vec<u8>> {
+        let key_blob = strip_km_compat_prefix(key_blob);
         let reply = self.device.transact(UPGRADE_KEY, &ask_upgrade(key_blob, params)).context("renew the key")?;
         let mut answer = Answer::new(reply.bytes());
         answer.status().context("renew the key")?;
@@ -442,5 +464,15 @@ mod tests {
         ]
         .concat();
         assert_eq!(parsed, vec![(TAG_PURPOSE, 1), (TAG_NONCE, 12)]);
+    }
+
+    #[test]
+    fn strips_km_compat_prefix() {
+        let prefixed = b"pKMblob\x00real_raw_key_material";
+        assert_eq!(strip_km_compat_prefix(prefixed), b"real_raw_key_material");
+        let soft_km = b"pKMblob\x01soft_raw_key_material";
+        assert_eq!(strip_km_compat_prefix(soft_km), b"soft_raw_key_material");
+        let normal = b"unprefixed_key_material";
+        assert_eq!(strip_km_compat_prefix(normal), normal);
     }
 }
