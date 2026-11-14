@@ -50,6 +50,7 @@ pub(crate) fn select_header(header: i32) {
 /// The mark this one is not. A directory that refuses one was built with the
 /// other: Android 16's system copy reads `SYST`, a recovery copy from
 /// Android 13 on reads `RECO`.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub(crate) fn alternate_header(header: i32) -> i32 {
     if header == HEADER_RECOVERY {
         HEADER_SYSTEM
@@ -116,6 +117,7 @@ impl Parcel {
         p
     }
 
+    #[cfg(test)]
     fn call_for(interface: &str, sdk: Option<u32>) -> Parcel {
         Self::call_with(interface, header_for(sdk))
     }
