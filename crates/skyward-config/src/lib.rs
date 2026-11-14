@@ -1093,13 +1093,15 @@ mod tests {
         assert_eq!(
             paths,
             [
-                "/vendor/bin/qseecomd",
                 "/system/bin/hwservicemanager",
-                "/vendor/bin/hw/android.hardware.keymaster@4.0-service-qti",
+                "/system/bin/qseecomd",
+                "/system/bin/android.hardware.keymaster@4.0-service-qti",
                 "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti",
             ]
         );
-        assert_eq!(cfg.services[0].libraries, ["/system/lib64", "/vendor/lib64"]);
+        assert_eq!(cfg.services[0].libraries, ["/system/lib64"]);
+        assert_eq!(cfg.services[0].ready_property.as_deref(), Some("hwservicemanager.ready"));
+        assert_eq!(cfg.services[1].libraries, ["/system/lib64", "/vendor/lib64"]);
         assert_eq!(cfg.services[2].ready_hardware_service.as_deref(), Some("android.hardware.keymaster@4.0::IKeymasterDevice/default"));
         assert_eq!(cfg.services[3].ready_hardware_service.as_deref(), Some("android.hardware.gatekeeper@1.0::IGatekeeper/default"));
         assert_eq!(cfg.backup.efs, ["modemst1", "modemst2", "fsg", "fsc", "oppostanvbk", "oppodycnvbk", "persist"]);
