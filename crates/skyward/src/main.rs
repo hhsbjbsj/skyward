@@ -701,10 +701,16 @@ fn recovery() -> Result<()> {
         skyward_sys::keep_log(Path::new(skyward_sys::LOG))?;
         // A recovery that ended with a function of its own in the port took
         // the port with it; going through "none" takes that function off.
+        // The screen still comes up when the port does not answer in time,
+        // so a failure goes to the kernel log.
         if skyward_sys::prop("sys.usb.state").is_some_and(|s| s != "adb") {
-            skyward_sys::usb::set("none", std::time::Duration::from_secs(5))?;
+            if let Err(e) = skyward_sys::usb::set("none", std::time::Duration::from_secs(5)) {
+                skyward_sys::kmsg(&format!("the USB port did not go to none: {e:#}"))?;
+            }
         }
-        skyward_sys::set_prop("sys.usb.config", "adb")?;
+        if let Err(e) = skyward_sys::set_prop("sys.usb.config", "adb") {
+            skyward_sys::kmsg(&format!("adb was not asked for: {e:#}"))?;
+        }
         let misc = bcb::misc();
         let message = bcb::read(&misc)?;
         let request = message.request();
