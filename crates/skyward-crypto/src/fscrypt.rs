@@ -267,6 +267,10 @@ mod tests {
         assert!(hardware_wrapped("aes-256-xts:aes-256-cts:v2+inlinecrypt_optimized+wrappedkey_v0"));
         assert!(!hardware_wrapped("aes-256-xts:aes-256-cts:v2"));
         assert!(!hardware_wrapped("aes-256-xts:aes-256-cts:v2+wrappedkey_v1"));
+        assert!(hardware_wrapped("ice:wrappedkey_v0"));
+        assert!(!hardware_wrapped("ice"));
+        assert_eq!(Policy::of("ice:wrappedkey_v0"), Policy::V1);
+        assert_eq!(Policy::of("ice"), Policy::V1);
     }
 
     #[test]

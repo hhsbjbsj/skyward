@@ -276,7 +276,7 @@ fn withhold(transfer: &mut Option<Transfer>, app: &mut App, now: u64) -> Result<
 /// computer has the port, as the USB controller tells it.
 fn fastboot_status() -> Result<(bool, UsbLink)> {
     let running = skyward_sys::prop("init.svc.fastbootd").as_deref() == Some("running");
-    Ok((running, usb_link()?))
+    Ok((running, usb_link()))
 }
 
 /// Light the panel, as on a cable going in or out, when the battery as it
@@ -292,21 +292,19 @@ fn plug(app: &mut App, was: &Option<skyward_info::Battery>, is: &Option<skyward_
 }
 
 /// How far a computer has the USB port, as the port's controller tells.
-fn usb_link() -> Result<UsbLink> {
+/// A missing controller or a state file that vanishes while the gadget
+/// resets is read as unplugged. Ending the UI for that makes init start
+/// the recovery again.
+fn usb_link() -> UsbLink {
     let controller = skyward_sys::prop("sys.usb.controller").filter(|c| !c.is_empty());
-    Ok(udc_state(Path::new("/sys/class/udc"), controller.as_deref()))
+    udc_state(Path::new("/sys/class/udc"), controller.as_deref())
 }
 
 /// Read the UDC link state from `controller` under `udc_root`, falling back to
-/// the first present UDC entry if `init` did not publish `sys.usb.controller`,
-/// and treating an absent UDC as unplugged rather than failing the UI loop.
+/// the first present UDC entry if init did not publish `sys.usb.controller`.
 fn udc_state(udc_root: &Path, controller: Option<&str>) -> UsbLink {
     let candidate = controller.map(|c| udc_root.join(c).join("state")).or_else(|| {
-        fs::read_dir(udc_root)
-            .ok()?
-            .flatten()
-            .map(|e| e.path().join("state"))
-            .find(|p| p.exists())
+        fs::read_dir(udc_root).ok()?.flatten().map(|e| e.path().join("state")).find(|p| p.exists())
     });
     let Some(state) = candidate.and_then(|p| fs::read_to_string(p).ok()) else {
         return UsbLink::Unplugged;
@@ -1571,7 +1569,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             && !joining
             && !running
             && asked.is_none()
-            && usb_link()? != UsbLink::Connected;
+            && usb_link() != UsbLink::Connected;
         sleeper.allow(may_sleep);
         let mut fds = vec![inputs.fd(), uevents.fd(), sleeper.fd()];
         if let Some(i) = &installer {
@@ -2620,7 +2618,9 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     // init stops fastbootd as the port goes through "none";
                     // then the slot's partitions come up as at boot.
                     Effect::EnterRecovery => {
-                        skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)?;
+                        if let Err(e) = skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT) {
+                            skyward_sys::kmsg(&format!("the port did not return to rest: {e:#}"))?;
+                        }
                         let slot = skyward_vab::current_slot()?;
                         crate::prepare(cfg, slot)?;
                         read_at = Instant::now();
