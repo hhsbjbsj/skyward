@@ -64,11 +64,42 @@ impl Message {
         self.data.extend_from_slice(&v.to_le_bytes());
     }
 
+    /// Reserve bytes for a child buffer whose pointer will be written into a
+    /// parent struct before emitting its [`Self::embedded`] address object.
+    pub fn stash(&mut self, bytes: Vec<u8>) -> u64 {
+        self.keep(bytes)
+    }
+
+    /// Write a standalone pointer buffer object and return its address index.
+    pub fn buffer(&mut self, bytes: Vec<u8>) -> usize {
+        let length = bytes.len();
+        let at = self.keep(bytes);
+        self.address_at(at, length, None)
+    }
+
+    /// Write a pointer buffer object embedded inside `parent` at `offset`.
+    pub fn embedded(&mut self, at: u64, length: usize, parent: usize, offset: u64) -> usize {
+        self.address_at(at, length, Some((parent, offset)))
+    }
+
+    /// Start a `hidl_vec` from pre-serialized element bytes (`at`, `count`,
+    /// `byte_len`), returning the address index of the element buffer so nested
+    /// fields inside it can point back to it via [`Self::embedded`].
+    pub fn vec_from(&mut self, at: u64, count: usize, byte_len: usize) -> usize {
+        let mut frame = Vec::with_capacity(FRAME_BYTES);
+        frame.extend_from_slice(&at.to_le_bytes());
+        frame.extend_from_slice(&(count as u32).to_le_bytes());
+        frame.extend_from_slice(&[0; 4]);
+        let frame_at = self.keep(frame);
+        let frame_idx = self.address_at(frame_at, FRAME_BYTES, None);
+        self.address_at(at, byte_len, Some((frame_idx, 0)))
+    }
+
     /// A run of bytes: the frame that says where they are, then an address
     /// for the bytes themselves.
     pub fn bytes(&mut self, value: &[u8]) {
         let at = self.keep(value.to_vec());
-        self.framed(at, value.len(), value.len());
+        self.vec_from(at, value.len(), value.len());
     }
 
     /// Text, which is a run of bytes with a terminator the count leaves
@@ -77,7 +108,7 @@ impl Message {
         let mut raw = value.as_bytes().to_vec();
         raw.push(0);
         let at = self.keep(raw);
-        self.framed(at, value.len(), value.len() + 1);
+        self.vec_from(at, value.len(), value.len() + 1);
     }
 
     /// Hold on to bytes the driver will read, and say where they are.
@@ -88,32 +119,19 @@ impl Message {
         at
     }
 
-    /// The pair of addresses a run of bytes is written as: the frame, and
-    /// then the bytes it points at.
-    fn framed(&mut self, at: u64, count: usize, length: usize) {
-        let mut frame = Vec::with_capacity(FRAME_BYTES);
-        frame.extend_from_slice(&at.to_le_bytes());
-        frame.extend_from_slice(&(count as u32).to_le_bytes());
-        // Whoever reads the frame does not free what it points at.
-        frame.extend_from_slice(&[0; 4]);
-        let frame_at = self.keep(frame);
-        let parent = self.address(frame_at, FRAME_BYTES, None);
-        self.address(at, length, Some(parent));
-    }
-
     /// Write an address among the values and say where it sits, which is
     /// how the driver finds it. The answer is which address this is, for
     /// the one pointing inside it to name.
-    fn address(&mut self, at: u64, length: usize, inside: Option<usize>) -> usize {
+    fn address_at(&mut self, at: u64, length: usize, inside: Option<(usize, u64)>) -> usize {
         let which = self.addresses.len();
         self.addresses.push(self.data.len() as u64);
         self.data.extend_from_slice(&ADDRESS.to_le_bytes());
         self.data.extend_from_slice(&inside.map_or(0, |_| INSIDE_ANOTHER).to_le_bytes());
         self.data.extend_from_slice(&at.to_le_bytes());
         self.data.extend_from_slice(&(length as u64).to_le_bytes());
-        self.data.extend_from_slice(&(inside.unwrap_or(0) as u64).to_le_bytes());
-        // The address inside the frame is the frame's first field.
-        self.data.extend_from_slice(&0u64.to_le_bytes());
+        let (parent, offset) = inside.unwrap_or((0, 0));
+        self.data.extend_from_slice(&(parent as u64).to_le_bytes());
+        self.data.extend_from_slice(&offset.to_le_bytes());
         self.pointed += (length as u64).next_multiple_of(WORD);
         which
     }
@@ -159,6 +177,10 @@ impl<'a> Answer<'a> {
 
     pub fn i32(&mut self) -> Result<i32> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().expect("four bytes")))
+    }
+
+    pub fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("eight bytes")))
     }
 
     /// A truth value: a byte, padded to four as everything is.

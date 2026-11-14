@@ -40,6 +40,31 @@ impl Entry {
     pub fn is_dir(&self) -> bool {
         self.mode & S_IFMT == S_IFDIR
     }
+
+    pub fn is_regular(&self) -> bool {
+        self.mode & S_IFMT == S_IFREG
+    }
+}
+
+/// Compression framing used for a boot or recovery ramdisk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    Lz4Legacy,
+    Gzip,
+    Lzma,
+}
+
+impl Compression {
+    /// Detect the compression format from the compressed stream's leading magic.
+    pub fn of(bytes: &[u8]) -> Self {
+        if bytes.starts_with(&[0x1f, 0x8b]) {
+            Self::Gzip
+        } else if bytes.starts_with(&[0x5d, 0x00]) {
+            Self::Lzma
+        } else {
+            Self::Lz4Legacy
+        }
+    }
 }
 
 /// An initramfs held in memory, so entries keep their owners, modes and
@@ -49,11 +74,22 @@ pub struct Ramdisk {
 }
 
 impl Ramdisk {
-    /// Unpack an LZ4 (legacy framing) compressed newc archive, as Android
-    /// boot images carry.
+    /// Unpack a compressed newc archive (LZ4 legacy framing, gzip, or LZMA alone),
+    /// as Android boot and recovery images carry.
     pub fn decode(compressed: &[u8]) -> Result<Self> {
-        let mut cpio = Vec::new();
-        lz4_flex::frame::FrameDecoder::new(compressed).read_to_end(&mut cpio).context("lz4 decode")?;
+        let cpio = match Compression::of(compressed) {
+            Compression::Gzip => {
+                let mut buf = Vec::new();
+                flate2::read::MultiGzDecoder::new(compressed).read_to_end(&mut buf).context("gzip decode")?;
+                buf
+            }
+            Compression::Lzma => run_tool("xz", &["--format=lzma", "-d", "-c"], compressed, "install xz-utils")?,
+            Compression::Lz4Legacy => {
+                let mut buf = Vec::new();
+                lz4_flex::frame::FrameDecoder::new(compressed).read_to_end(&mut buf).context("lz4 decode")?;
+                buf
+            }
+        };
         let mut entries = Vec::new();
         let mut rest = Cursor::new(cpio.as_slice());
         loop {
@@ -84,7 +120,21 @@ impl Ramdisk {
     /// with the reference `lz4` tool in legacy framing (the kernel's initramfs
     /// unpacker reads no other LZ4 framing) at its highest compression.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        lz4_tool(&self.archive()?)
+        self.encode_as(Compression::Lz4Legacy)
+    }
+
+    /// Pack as a newc archive with the requested compression format.
+    pub fn encode_as(&self, compression: Compression) -> Result<Vec<u8>> {
+        let raw = self.archive()?;
+        match compression {
+            Compression::Lz4Legacy => run_tool("lz4", &["-l", "-12", "--favor-decSpeed", "-c"], &raw, "install it, e.g. `brew install lz4`"),
+            Compression::Gzip => {
+                let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                enc.write_all(&raw).context("gzip encode")?;
+                enc.finish().context("gzip finish")
+            }
+            Compression::Lzma => run_tool("xz", &["--format=lzma", "-6", "-c"], &raw, "install xz-utils"),
+        }
     }
 
     /// Pack as a newc archive, uncompressed.
@@ -144,6 +194,30 @@ impl Ramdisk {
             Some(_) => bail!("{name} is not a regular file"),
             None => bail!("{name} is not in the ramdisk"),
         }
+    }
+
+    /// Replace an existing non-directory entry (regular file or symlink) with a
+    /// root-owned regular file, or add a new regular file when missing.
+    pub fn replace_or_add(&mut self, name: &str, mode: u32, data: Vec<u8>) -> Result<()> {
+        match self.entries.iter_mut().find(|e| e.name == name) {
+            Some(e) if e.mode & S_IFMT == S_IFREG => {
+                e.data = data;
+                Ok(())
+            }
+            Some(e) if !e.is_dir() => {
+                *e = root_entry(name, S_IFREG | mode, data);
+                Ok(())
+            }
+            Some(_) => bail!("{name} is a directory"),
+            None => self.add(name, mode, data),
+        }
+    }
+
+    /// Remove the entry named `prefix` and any entries nested under `prefix/`.
+    pub fn remove_prefix(&mut self, prefix: &str) {
+        let prefix = prefix.trim_end_matches('/');
+        let nested = format!("{prefix}/");
+        self.entries.retain(|e| e.name != prefix && !e.name.starts_with(&nested));
     }
 
     /// Add a root-owned regular file, creating missing parent directories.
@@ -275,20 +349,20 @@ pub fn lz4_legacy(input: &[u8]) -> Vec<u8> {
     out
 }
 
-fn lz4_tool(input: &[u8]) -> Result<Vec<u8>> {
-    let mut child = Command::new("lz4")
-        .args(["-l", "-12", "--favor-decSpeed", "-c"])
+fn run_tool(program: &str, args: &[&str], input: &[u8], hint: &str) -> Result<Vec<u8>> {
+    let mut child = Command::new(program)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .context("run lz4 (install it, e.g. `brew install lz4`)")?;
+        .with_context(|| format!("run {program} ({hint})"))?;
     let mut stdin = child.stdin.take().expect("stdin is piped");
     let input = input.to_vec();
     let writer = std::thread::spawn(move || stdin.write_all(&input));
-    let out = child.wait_with_output().context("lz4")?;
-    writer.join().expect("lz4 writer thread").context("feed lz4")?;
+    let out = child.wait_with_output().with_context(|| program.to_string())?;
+    writer.join().expect("tool writer thread").with_context(|| format!("feed {program}"))?;
     if !out.status.success() {
-        bail!("lz4 exited with {}", out.status);
+        bail!("{program} exited with {}", out.status);
     }
     Ok(out.stdout)
 }
@@ -452,5 +526,38 @@ mod tests {
         assert_eq!((unzip.data.as_slice(), unzip.mode, unzip.gid), (b"recovery".as_slice(), S_IFLNK | 0o755, 2000));
         assert_eq!(back.entries.len(), count, "no second entry of the name");
         assert!(back.find("system/bin/ziptool").is_some(), "what it pointed to stays");
+    }
+
+    #[test]
+    fn gzip_round_trip_and_replace_or_add() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.add("system/bin/recovery", 0o750, b"binary".to_vec()).unwrap();
+        rd.link("prop.default", "/cache/runtime.prop").unwrap();
+        let gz = rd.encode_as(Compression::Gzip).unwrap();
+        assert_eq!(Compression::of(&gz), Compression::Gzip);
+        let mut back = Ramdisk::decode(&gz).unwrap();
+        assert_eq!(back.find("system/bin/recovery").unwrap().data, b"binary");
+        back.replace_or_add("prop.default", 0o644, b"ro.debuggable=1\n".to_vec()).unwrap();
+        let prop = back.find("prop.default").unwrap();
+        assert!(prop.is_regular());
+        assert_eq!(prop.data, b"ro.debuggable=1\n");
+    }
+
+    #[test]
+    fn lzma_round_trip_and_remove_prefix() {
+        assert_eq!(Compression::of(&[0x5d, 0x00, 0x00, 0x80, 0x00]), Compression::Lzma);
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.add("res/ColorOS/ttf/a.ttf", 0o644, b"font".to_vec()).unwrap();
+        rd.add("res/ColorOS/ttf_keep/icon.png", 0o644, b"png".to_vec()).unwrap();
+        rd.add("system/bin/recovery", 0o750, b"bin".to_vec()).unwrap();
+        rd.remove_prefix("res/ColorOS/ttf");
+        assert!(rd.find("res/ColorOS/ttf").is_none());
+        assert!(rd.find("res/ColorOS/ttf/a.ttf").is_none());
+        assert!(rd.find("res/ColorOS/ttf_keep/icon.png").is_some());
+        let packed = rd.encode_as(Compression::Lzma).unwrap();
+        assert_eq!(Compression::of(&packed), Compression::Lzma);
+        let back = Ramdisk::decode(&packed).unwrap();
+        assert_eq!(back.find("system/bin/recovery").unwrap().data, b"bin");
+        assert_eq!(back.find("res/ColorOS/ttf_keep/icon.png").unwrap().data, b"png");
     }
 }

@@ -143,35 +143,56 @@ const NORMAL_MAX: [(&str, &str); 3] = [
     ("mi,mdss-dsi-fac-bl-max-level", "qcom,mdss-dsi-bl-max-level"),
 ];
 
+fn write_display(writes: &[skyward_config::Write]) {
+    for w in writes {
+        let path = Path::new(&w.path);
+        if path.exists() {
+            if let Err(e) = fs::write(path, &w.value) {
+                let _ = skyward_sys::kmsg(&format!("display: failed to write {}: {e}", w.path));
+            }
+        }
+    }
+}
+
 /// The raw backlight level, out of `max`, at the panel's normal maximum.
 /// Above it the panel runs in high brightness mode, which the stock system
 /// keeps for strong sunlight and its slider does not reach. The panel the
 /// display driver booted with gives that maximum in the device tree.
 fn normal_max(max: u32) -> Result<u32> {
     let param = "/sys/module/msm_drm/parameters/dsi_display0";
-    let boot = fs::read_to_string(param).with_context(|| format!("read {param}"))?;
+    let boot = match fs::read_to_string(param) {
+        Ok(boot) => boot,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(max),
+        Err(e) => return Err(e).with_context(|| format!("read {param}")),
+    };
     // The panel's node, then its configuration after a colon, as in
     // "qcom,mdss_dsi_m1_42_02_0a_dsc_cmd:"; the driver takes no name
     // without the colon either.
-    let (name, _) = boot.trim().split_once(':').with_context(|| format!("{param} names no panel: {boot:?}"))?;
+    let Some((name, _)) = boot.trim().split_once(':') else {
+        return Ok(max);
+    };
     let soc = Path::new("/proc/device-tree/soc");
-    let node = fs::read_dir(soc)
+    if !soc.is_dir() {
+        return Ok(max);
+    }
+    let Some(node) = fs::read_dir(soc)
         .with_context(|| format!("read {}", soc.display()))?
         .map(|e| e.map(|e| e.path().join(name)))
         .collect::<std::io::Result<Vec<_>>>()?
         .into_iter()
         .find(|p| p.is_dir())
-        .ok_or_else(|| anyhow!("panel {name} is not in the device tree"))?;
+    else {
+        return Ok(max);
+    };
     let cell = |prop: &str| -> Result<u32> {
         let path = node.join(prop);
         let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         let cell: [u8; 4] = bytes.as_slice().try_into().map_err(|_| anyhow!("{} is not one cell", path.display()))?;
         Ok(u32::from_be_bytes(cell))
     };
-    let (normal, full) = NORMAL_MAX
-        .iter()
-        .find(|(normal, _)| node.join(normal).exists())
-        .with_context(|| format!("panel {name} gives its normal maximum as none of {NORMAL_MAX:?}"))?;
+    let Some((normal, full)) = NORMAL_MAX.iter().find(|(normal, _)| node.join(normal).exists()) else {
+        return Ok(max);
+    };
     let (normal, full) = (cell(normal)?, cell(full)?);
     ensure!(normal > 0 && normal <= full, "panel {name}: normal maximum {normal} out of {full}");
     Ok((f64::from(max) * f64::from(normal) / f64::from(full)).round() as u32)
@@ -936,15 +957,16 @@ fn read_folder(path: &Path) -> Result<Vec<FileRow>> {
 /// are started again from there whenever they end.
 fn read_mounts(services: &[Service]) -> Result<Vec<skyward_ui::app::MountRow>> {
     use skyward_ui::app::MountRow;
-    let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+    let slot = skyward_vab::current_slot()?;
     let shown = skyward_vab::mounted_partitions(slot)?;
     let holders = skyward_block::mount::holders()?;
     let props = skyward_info::installed_props(slot)?;
     let services: Vec<&Service> = services.iter().filter(|s| s.runs_on(&props)).collect();
+    let suffix = slot.map_or("", skyward_vab::Slot::suffix);
     let mut rows = Vec::new();
     for base in skyward_vab::slot_bases(slot)? {
         let point = skyward_vab::mount_point(&base);
-        let name = format!("{base}{}", slot.suffix());
+        let name = format!("{base}{suffix}");
         let mounted = shown.iter().find(|m| m.partition == name);
         let mut using = BTreeSet::new();
         if let Some(m) = mounted {
@@ -999,7 +1021,7 @@ fn set_slot(slot: skyward_vab::Slot) -> Result<skyward_vab::BootSlots, String> {
 /// and the booted slot's partitions come off.
 fn detach(services: Vec<Service>) -> Detach {
     Box::new(move || {
-        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+        let slot = skyward_vab::current_slot()?;
         let mounted = skyward_vab::mounted_partitions(slot)?;
         let busy = services::pin(&services, &mounted)?;
         skyward_vab::release_partitions(slot, &busy)
@@ -1024,7 +1046,7 @@ fn wlan_worker(w: &Option<wlan::Worker>) -> Result<&wlan::Worker> {
 /// The installed system, as the update server is told of it.
 fn installed(cfg: &DeviceConfig, info: &skyward_info::DeviceInfo) -> Result<Installed> {
     let slot = info.slot.context("only an A/B phone is updated")?;
-    let props = skyward_info::installed_props(slot)?;
+    let props = skyward_info::installed_props(Some(slot))?;
     let prop = |name: &str| props.get(name).cloned().with_context(|| format!("the installed system says no {name}"));
     Ok(Installed {
         device: prop("ro.product.mod_device")?,
@@ -1340,8 +1362,11 @@ impl<'a> Pages<'a> {
         // partitions in both slots, which a switch writes.
         let by_name = Path::new(skyward_block::BY_NAME);
         let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
-        app.state.recovery_partitions = both("recovery")?;
-        app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
+        app.state.recovery_partitions = match info.slot {
+            Some(_) => both("recovery")?,
+            None => by_name.join("recovery").try_exists()?,
+        };
+        app.state.dual_boot = info.slot.is_some() && app.state.recovery_partitions && both("boot")? && both("init_boot")?;
         // The second system's work; the systems are read at once, for the home
         // page to name the one that starts, once a switch cut off before is
         // finished.
@@ -1479,7 +1504,7 @@ impl<'a> Pages<'a> {
                 self.part_worker = Some(partwork::Worker::start(partwork::Task::Disable { package_size: *package_size })?);
             }
             Work::UnshareBlocks => {
-                let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+                let slot = skyward_vab::current_slot()?;
                 self.app.part_work_started(PartKind::Unshare, true);
                 self.part_worker = Some(partwork::Worker::start(partwork::Task::Unshare { slot })?);
             }
@@ -1716,6 +1741,7 @@ impl<'a> Pages<'a> {
         // went off.
         if self.backlight.level == 0 && panel.is_some() {
             self.surface.settle()?;
+            write_display(&self.cfg.display.writes);
         }
         self.backlight.show(panel)?;
         if panel.is_some() {
@@ -2523,8 +2549,11 @@ impl Pages<'_> {
                 }
             }
             Effect::Flash { partition, pick } => {
-                let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                self.installer.as_ref().context("no installer holds an image")?.flash(partition, pick.slots(slot));
+                let slots = match skyward_vab::current_slot()? {
+                    Some(slot) => pick.slots(slot),
+                    None => Vec::new(),
+                };
+                self.installer.as_ref().context("no installer holds an image")?.flash(partition, slots);
             }
             Effect::Cancel => self.cancel_install(now)?,
             Effect::ReadMounts => self.app.set_mounts(self.mounts()),
@@ -2671,14 +2700,14 @@ impl Pages<'_> {
             // A partition that will not mount, or is in use, is the
             // page's to report; the recovery carries on.
             Effect::Mount(base) => {
-                let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+                let slot = skyward_vab::current_slot()?;
                 if let Err(e) = skyward_vab::mount_one(slot, &base) {
                     self.app.mount_failed(MountFailure { mounting: true, base, detail: format!("{e:#}") });
                 }
                 self.app.set_mounts(self.mounts());
             }
             Effect::Unmount(base) => {
-                let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+                let slot = skyward_vab::current_slot()?;
                 if let Err(e) = skyward_vab::unmount_one(slot, &base) {
                     self.app.mount_failed(MountFailure { mounting: false, base, detail: format!("{e:#}") });
                 }
@@ -2835,7 +2864,7 @@ impl Pages<'_> {
     /// the page's to report, with what to do first.
     fn relabel(&mut self, now: u64) -> Result<()> {
         ensure!(self.relabeler.is_none(), "relabeling is under way already");
-        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+        let slot = skyward_vab::current_slot()?;
         match relabel::rule_files(slot) {
             Ok(rules) => {
                 self.relabeler = Some(filework::Worker::start(filework::Task::Relabel { rules })?);
@@ -2974,7 +3003,7 @@ impl Pages<'_> {
     /// boot.
     fn enter_recovery(&mut self) -> Result<()> {
         skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)?;
-        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+        let slot = skyward_vab::current_slot()?;
         crate::prepare(self.cfg, slot)?;
         self.read_at = Instant::now();
         read_details(self.cfg, &mut self.info, &mut self.unread.details)?;

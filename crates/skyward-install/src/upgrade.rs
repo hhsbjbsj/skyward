@@ -39,7 +39,7 @@ pub fn check(image: &[u8], codename: &str) -> Result<()> {
 pub fn slots(dir: &Path, next: Slot) -> Result<Vec<Slot>> {
     let mut slots = Vec::new();
     for slot in [Slot::A, Slot::B] {
-        let path = image::device(dir, PARTITION, slot);
+        let path = image::device(dir, PARTITION, Some(slot));
         let mut file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
         image::drop_cache(&file).with_context(|| format!("drop the cached pages of {}", path.display()))?;
         if slot == next || image::is_skyward(&mut file).with_context(|| format!("look into {}", path.display()))? {
@@ -49,10 +49,15 @@ pub fn slots(dir: &Path, next: Slot) -> Result<Vec<Slot>> {
     Ok(slots)
 }
 
-/// Write `image` into the recovery partitions of `slots`, among the links
+/// Write `image` into the recovery partitions of `slots` (or the single
+/// static `recovery` partition when `slots` is empty), among the links
 /// in `dir`, and read each back; `progress` hears the bytes so far, of all.
 pub fn write(dir: &Path, image: &[u8], slots: &[Slot], progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
-    let devices: Vec<PathBuf> = slots.iter().map(|&slot| image::device(dir, PARTITION, slot)).collect();
+    let devices: Vec<PathBuf> = if slots.is_empty() {
+        vec![image::device(dir, PARTITION, None)]
+    } else {
+        slots.iter().map(|&slot| image::device(dir, PARTITION, Some(slot))).collect()
+    };
     image::flash(&mut Cursor::new(image), image.len() as u64, &devices, progress)
 }
 
@@ -129,5 +134,20 @@ mod tests {
         assert_eq!(told.last(), Some(&(total, total)), "written and read back");
         assert_eq!(&std::fs::read(dir.path().join("recovery_a")).unwrap()[..newer.len()], &newer[..]);
         assert_eq!(&std::fs::read(dir.path().join("recovery_b")).unwrap()[..stock.len()], &stock[..], "the other slot left alone");
+    }
+
+    #[test]
+    fn the_build_goes_to_the_single_recovery_partition_when_no_slots_are_given() {
+        let (older, newer) = (recovery(true), skyward_for("pchm30"));
+        let size = older.len().max(newer.len()) + 4096;
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = older.clone();
+        bytes.resize(size, 0);
+        std::fs::write(dir.path().join("recovery"), bytes).unwrap();
+        let mut told = Vec::new();
+        write(dir.path(), &newer, &[], &mut |done, total| told.push((done, total))).unwrap();
+        let total = 2 * newer.len() as u64;
+        assert_eq!(told.last(), Some(&(total, total)));
+        assert_eq!(&std::fs::read(dir.path().join("recovery")).unwrap()[..newer.len()], &newer[..]);
     }
 }

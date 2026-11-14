@@ -69,15 +69,22 @@ impl StoredKey {
         if version.trim() != VERSION {
             bail!("{} is written in layout {}, Skyward reads layout {VERSION}", dir.display(), version.trim());
         }
-        if dir.join(FN_STRETCHING).exists() {
-            bail!("{} was written by an Android too old for Skyward to read", dir.display());
+        let stretching = dir.join(FN_STRETCHING);
+        if stretching.exists() {
+            let kind = fs::read_to_string(&stretching).with_context(|| format!("read {}", stretching.display()))?;
+            if kind.trim() != "nopassword" {
+                bail!("{} was written by an Android too old for Skyward to read", dir.display());
+            }
         }
         let secdiscardable_hash = match dir.join(FN_SECDISCARDABLE).exists() {
             true => hash_with_prefix(SECDISCARDABLE_PREFIX, &read(FN_SECDISCARDABLE)?),
             false => Vec::new(),
         };
         let key_blob = match dir.join(FN_KEY_BLOB).exists() {
-            true => Some(read(FN_KEY_BLOB)?),
+            true => {
+                let raw = read(FN_KEY_BLOB)?;
+                Some(crate::keymaster4::strip_km_compat_prefix(&raw).to_vec())
+            }
             false => None,
         };
         Ok(StoredKey { encrypted: read(FN_ENCRYPTED_KEY)?, key_blob, secdiscardable_hash })
@@ -94,7 +101,7 @@ impl StoredKey {
 
     /// What the phone's key service says the wrapping key may be used for.
     #[cfg(target_os = "android")]
-    pub fn authorizations(&self, service: &crate::keymint::KeyMint) -> Result<Vec<(i32, i64)>> {
+    pub fn authorizations(&self, service: &crate::KeyService) -> Result<Vec<(i32, i64)>> {
         let blob = self.key_blob.as_ref().context("this key is wrapped by a secret, not by the key service")?;
         service.authorizations(blob, &self.app_id(&[]))
     }
@@ -139,16 +146,20 @@ mod tests {
     fn a_prefixed_hash_is_the_block_of_prefix_then_the_bytes() {
         let secdiscardable = hash_with_prefix(SECDISCARDABLE_PREFIX, b"test");
         assert_eq!(
-            hex::encode(secdiscardable),
+            hex(&secdiscardable),
             "d29166a7b1dc78f68cdcb0e473a2d53421c932ee938167a2f41784e7f52adde2\
              02256f9eb3dcba42f08eef5be27bc87090e56c5b9099996f502939ab8961abcf"
         );
         let keygen = hash_with_prefix(KEYGEN_PREFIX, b"secret");
         assert_eq!(
-            hex::encode(keygen),
+            hex(&keygen),
             "1f0f944ae6b818481d8026af59a336cd84d6847475fa28196fc424a23794f21b\
              bae4f35a8be077f2c3fed1e4e5adbb58f1f97d522f5131b8cedcf4102478049d"
         );
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// Wrap a key the way Android does, to read it back.
@@ -219,6 +230,17 @@ mod tests {
     fn a_wrapped_key_too_short_to_hold_anything_is_refused() {
         let s = stored(b"x", vec![0; 20]);
         assert!(s.unwrap(Unwrap::<NoService>::Secret(b"s")).is_err());
+    }
+
+    #[test]
+    fn a_directory_with_nopassword_stretching_loads() {
+        let dir = tempdir("nopassword");
+        let key = [0x33u8; 32];
+        fs::write(dir.join(FN_VERSION), "1").unwrap();
+        fs::write(dir.join(FN_STRETCHING), "nopassword").unwrap();
+        fs::write(dir.join(FN_ENCRYPTED_KEY), wrap(b"secret", &[4; NONCE_BYTES], &key)).unwrap();
+        let s = StoredKey::load(&dir).unwrap();
+        assert_eq!(s.unwrap(Unwrap::<NoService>::Secret(b"secret")).unwrap(), key.to_vec());
     }
 
     #[test]

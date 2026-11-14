@@ -2465,6 +2465,7 @@ dependencies = [
  "sha2 0.10.9",
  "skyward-binder",
  "skyward-block",
+ "skyward-sys",
 ]
 
 [[package]]
@@ -2587,6 +2588,7 @@ version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
+ "flate2",
  "hex",
  "rust-fs-core",
  "rust-fs-erofs",
@@ -2597,6 +2599,7 @@ dependencies = [
  "skyward-programs",
  "tempfile",
  "unpayload",
+ "ureq",
 ]
 
 [[package]]

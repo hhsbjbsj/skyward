@@ -18,6 +18,9 @@ pub const E2FSCK: &str = "e2fsck";
 /// made here, it would move their mark.
 const CHECK_F2FS: [&str; 5] = ["-a", "--no-kernel-check", "-c", "10000", "--debug-cache"];
 
+/// What checks ext4 before mounting: automatically repair safe errors without asking.
+const CHECK_EXT: [&str; 1] = ["-p"];
+
 /// What repairs f2fs: every part of the partition checked, and all that is
 /// found fixed.
 const REPAIR_F2FS: [&str; 6] = ["-f", "-y", "--no-kernel-check", "-c", "10000", "--debug-cache"];
@@ -50,6 +53,13 @@ pub fn check(device: &Path, filesystem: &str) -> Result<Checked> {
     match filesystem {
         "f2fs" => {
             let ran = tools::find(FSCK_F2FS)?.run(&arguments(&CHECK_F2FS, device)?)?;
+            Ok(Checked { status: ran.status, said: ran.said })
+        }
+        "ext4" | "ext3" | "ext2" => {
+            let ran = tools::find(E2FSCK)?.run(&arguments(&CHECK_EXT, device)?)?;
+            if ran.status != CLEAN && !FIXED.contains(&ran.status) {
+                bail!("e2fsck failed with exit code {}: {}", ran.status, ran.said);
+            }
             Ok(Checked { status: ran.status, said: ran.said })
         }
         other => bail!("{} holds {other}, which the recovery does not check before writing to it", device.display()),
@@ -125,8 +135,14 @@ mod tests {
     }
 
     #[test]
+    fn ext4_is_checked_with_preen() {
+        let args = arguments(&CHECK_EXT, Path::new("/dev/block/dm-9")).unwrap();
+        assert_eq!(args, ["-p", "/dev/block/dm-9"]);
+    }
+
+    #[test]
     fn a_filesystem_the_recovery_does_not_check_or_repair_is_refused() {
-        assert!(check(Path::new("/dev/x"), "ext4").is_err(), "only f2fs is checked before mounting");
+        assert!(check(Path::new("/dev/x"), "erofs").is_err(), "erofs is not checked before mounting");
         assert!(repair(Path::new("/dev/x"), "erofs").is_err());
     }
 

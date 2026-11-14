@@ -3,7 +3,7 @@
 //! partition held before the install, and which slots get it back after.
 
 use crate::image;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use skyward_vab::Slot;
 use std::fs::File;
@@ -20,43 +20,74 @@ pub struct Held {
     pub skyward: bool,
 }
 
-/// This recovery, held from the current slot's recovery partition before
-/// an install, and what each slot's partition held then, slot A first.
+#[derive(Clone, Copy)]
+enum Before {
+    Ab([Held; 2]),
+    Static,
+}
+
+/// This recovery, held from the current slot's (or single static) recovery
+/// partition before an install, and what each slot's partition held then,
+/// slot A first on A/B devices.
 pub struct Kept {
     dir: PathBuf,
     image: Vec<u8>,
     own: [u8; 32],
-    before: [Held; 2],
+    before: Before,
 }
 
 impl Kept {
     /// Hold this recovery from the recovery partitions among the links in
     /// `dir`, before an install; none when the partition of the `current`
-    /// slot does not hold Skyward, as when it was started without being
-    /// flashed.
-    pub fn hold(dir: &Path, current: Slot) -> Result<Option<Kept>> {
-        let (a, image_a) = read(&image::device(dir, PARTITION, Slot::A))?;
-        let (b, image_b) = read(&image::device(dir, PARTITION, Slot::B))?;
-        let (held, image) = match current {
-            Slot::A => (a, image_a),
-            Slot::B => (b, image_b),
-        };
-        Ok(held.skyward.then(|| Kept { dir: dir.to_path_buf(), image, own: held.digest, before: [a, b] }))
+    /// slot (or single static recovery partition when `current` is `None`)
+    /// does not hold Skyward, as when it was started without being flashed.
+    pub fn hold(dir: &Path, current: Option<Slot>) -> Result<Option<Kept>> {
+        match current {
+            Some(current) => {
+                let (a, image_a) = read(&image::device(dir, PARTITION, Some(Slot::A)))?;
+                let (b, image_b) = read(&image::device(dir, PARTITION, Some(Slot::B)))?;
+                let (held, image) = match current {
+                    Slot::A => (a, image_a),
+                    Slot::B => (b, image_b),
+                };
+                Ok(held.skyward.then(|| Kept { dir: dir.to_path_buf(), image, own: held.digest, before: Before::Ab([a, b]) }))
+            }
+            None => {
+                let (held, image) = read(&image::device(dir, PARTITION, None))?;
+                Ok(held.skyward.then(|| Kept { dir: dir.to_path_buf(), image, own: held.digest, before: Before::Static }))
+            }
+        }
     }
 
-    /// The slots whose recovery partition gets this recovery back, by what
-    /// the partitions hold once the install is done; `next` is the slot
-    /// that starts next.
-    pub fn wanted(&self, next: Slot) -> Result<Vec<Slot>> {
-        let (a, _) = read(&image::device(&self.dir, PARTITION, Slot::A))?;
-        let (b, _) = read(&image::device(&self.dir, PARTITION, Slot::B))?;
-        Ok(restore(self.before, [a, b], self.own, next))
+    /// Which recovery partitions get this recovery back once an install is
+    /// done: `None` when nothing needs rewriting, `Some(slots)` on A/B
+    /// (`next` is the slot that starts next), or `Some(vec![])` for the
+    /// single static recovery partition on non-A/B phones.
+    pub fn wanted(&self, next: Option<Slot>) -> Result<Option<Vec<Slot>>> {
+        match (self.before, next) {
+            (Before::Ab(before), Some(next)) => {
+                let (a, _) = read(&image::device(&self.dir, PARTITION, Some(Slot::A)))?;
+                let (b, _) = read(&image::device(&self.dir, PARTITION, Some(Slot::B)))?;
+                let slots = restore(before, [a, b], self.own, next);
+                Ok((!slots.is_empty()).then_some(slots))
+            }
+            (Before::Static, None) => {
+                let (now, _) = read(&image::device(&self.dir, PARTITION, None))?;
+                Ok((now.digest != self.own).then_some(Vec::new()))
+            }
+            _ => bail!("slot expectation changed between hold and restore"),
+        }
     }
 
-    /// Write this recovery into the recovery partitions of `slots` and read
+    /// Write this recovery into the recovery partitions of `slots` (or the
+    /// single static recovery partition when `slots` is empty) and read
     /// each back; `progress` hears the bytes so far, of all.
     pub fn write(&self, slots: &[Slot], progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
-        let devices: Vec<PathBuf> = slots.iter().map(|&slot| image::device(&self.dir, PARTITION, slot)).collect();
+        let devices: Vec<PathBuf> = if slots.is_empty() {
+            vec![image::device(&self.dir, PARTITION, None)]
+        } else {
+            slots.iter().map(|&slot| image::device(&self.dir, PARTITION, Some(slot))).collect()
+        };
         image::flash(&mut Cursor::new(&self.image), self.image.len() as u64, &devices, progress)
     }
 }
@@ -134,29 +165,48 @@ mod tests {
         let (skyward, stock) = (recovery(true), recovery(false));
         let size = skyward.len().max(stock.len()) + 4096;
         let dir = partitions(&skyward, &stock, size);
-        let kept = Kept::hold(dir.path(), Slot::A).unwrap().expect("slot A's partition holds Skyward");
-        assert!(kept.wanted(Slot::A).unwrap().is_empty(), "nothing written over");
+        let kept = Kept::hold(dir.path(), Some(Slot::A)).unwrap().expect("slot A's partition holds Skyward");
+        assert!(kept.wanted(Some(Slot::A)).unwrap().is_none(), "nothing written over");
         // A package puts the stock recovery in both slots.
         let mut written = stock.clone();
         written.resize(size, 0);
         std::fs::write(dir.path().join("recovery_a"), &written).unwrap();
-        assert_eq!(kept.wanted(Slot::A).unwrap(), [Slot::A], "slot B held the stock recovery already");
+        assert_eq!(kept.wanted(Some(Slot::A)).unwrap(), Some(vec![Slot::A]), "slot B held the stock recovery already");
         let mut told = Vec::new();
         kept.write(&[Slot::A], &mut |done, total| told.push((done, total))).unwrap();
         assert_eq!(told.last(), Some(&(2 * size as u64, 2 * size as u64)), "written and read back");
         let mut whole = skyward.clone();
         whole.resize(size, 0);
         assert_eq!(std::fs::read(dir.path().join("recovery_a")).unwrap(), whole);
-        assert!(kept.wanted(Slot::A).unwrap().is_empty());
-        assert_eq!(kept.wanted(Slot::B).unwrap(), [Slot::B], "an install that has slot B start next");
+        assert!(kept.wanted(Some(Slot::A)).unwrap().is_none());
+        assert_eq!(kept.wanted(Some(Slot::B)).unwrap(), Some(vec![Slot::B]), "an install that has slot B start next");
     }
 
     #[test]
     fn nothing_is_kept_when_this_recovery_was_started_without_being_flashed() {
         let dir = partitions(&recovery(false), &recovery(false), 1 << 20);
-        assert!(Kept::hold(dir.path(), Slot::B).unwrap().is_none());
+        assert!(Kept::hold(dir.path(), Some(Slot::B)).unwrap().is_none());
         let erased = partitions(&recovery(true), &[], 1 << 20);
-        assert!(Kept::hold(erased.path(), Slot::B).unwrap().is_none(), "an erased partition");
-        assert!(Kept::hold(erased.path(), Slot::A).unwrap().is_some());
+        assert!(Kept::hold(erased.path(), Some(Slot::B)).unwrap().is_none(), "an erased partition");
+        assert!(Kept::hold(erased.path(), Some(Slot::A)).unwrap().is_some());
+    }
+
+    #[test]
+    fn this_recovery_goes_back_to_single_recovery_partition_when_overwritten() {
+        let (skyward, stock) = (recovery(true), recovery(false));
+        let size = skyward.len().max(stock.len()) + 4096;
+        let dir = tempfile::tempdir().unwrap();
+        let mut whole = skyward.clone();
+        whole.resize(size, 0);
+        std::fs::write(dir.path().join("recovery"), &whole).unwrap();
+        let kept = Kept::hold(dir.path(), None).unwrap().expect("recovery partition holds Skyward");
+        assert_eq!(kept.wanted(None).unwrap(), None);
+        let mut written = stock;
+        written.resize(size, 0);
+        std::fs::write(dir.path().join("recovery"), &written).unwrap();
+        assert_eq!(kept.wanted(None).unwrap(), Some(Vec::new()));
+        kept.write(&[], &mut |_, _| {}).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("recovery")).unwrap(), whole);
+        assert_eq!(kept.wanted(None).unwrap(), None);
     }
 }

@@ -173,21 +173,37 @@ pub fn device_config<R: Read + Seek>(file: &mut R) -> Result<Option<Vec<u8>>> {
     find(ramdisk, |name| name == skyward_config::ramdisk::CONFIG, read).context("read the ramdisk")
 }
 
-/// The partition `name` of `slot` among the links in `dir`.
-pub fn device(dir: &Path, name: &str, slot: Slot) -> PathBuf {
-    dir.join(format!("{name}{}", slot.suffix()))
+/// The partition `name` of `slot` among the links in `dir`, or the
+/// single static partition `name` when `slot` is `None`.
+pub fn device(dir: &Path, name: &str, slot: Option<Slot>) -> PathBuf {
+    match slot {
+        Some(slot) => dir.join(format!("{name}{}", slot.suffix())),
+        None => dir.join(name),
+    }
 }
 
 /// The partitions `kind` fits that this phone has in both slots, among the
 /// links in `dir`, the likeliest first.
 pub fn partitions(kind: ImageKind, dir: &Path) -> Result<Vec<&'static str>> {
+    partitions_for(kind, dir, true)
+}
+
+/// Like [`partitions`], checking both slots when `ab` is true and single
+/// un-slotted partitions otherwise.
+pub fn partitions_for(kind: ImageKind, dir: &Path, ab: bool) -> Result<Vec<&'static str>> {
     let mut found = Vec::new();
     for name in kind.partitions() {
-        let mut has = true;
-        for slot in [Slot::A, Slot::B] {
-            let path = device(dir, name, slot);
-            has &= path.try_exists().with_context(|| format!("look for {}", path.display()))?;
-        }
+        let has = if ab {
+            let mut both = true;
+            for slot in [Slot::A, Slot::B] {
+                let path = device(dir, name, Some(slot));
+                both &= path.try_exists().with_context(|| format!("look for {}", path.display()))?;
+            }
+            both
+        } else {
+            let path = device(dir, name, None);
+            path.try_exists().with_context(|| format!("look for {}", path.display()))?
+        };
         if has {
             found.push(*name);
         }
@@ -411,13 +427,15 @@ mod tests {
     #[test]
     fn only_partitions_the_phone_has_in_both_slots_are_offered() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["boot_a", "boot_b", "recovery_a", "recovery_b", "init_boot_a", "init_boot_b", "vbmeta_a", "vbmeta_b", "vbmeta_system_a"] {
+        for name in ["boot_a", "boot_b", "recovery_a", "recovery_b", "init_boot_a", "init_boot_b", "vbmeta_a", "vbmeta_b", "vbmeta_system_a", "recovery", "boot"] {
             std::fs::File::create(dir.path().join(name)).unwrap();
         }
         let both = ImageKind::Boot { kernel: true, ramdisk: Ramdisk::Recovery };
         assert_eq!(partitions(both, dir.path()).unwrap(), ["recovery", "boot"]);
         assert_eq!(partitions(ImageKind::Vbmeta, dir.path()).unwrap(), ["vbmeta"]);
         assert!(partitions(ImageKind::Dtbo, dir.path()).unwrap().is_empty());
+        assert_eq!(partitions_for(both, dir.path(), false).unwrap(), ["recovery", "boot"]);
+        assert!(partitions_for(ImageKind::Vbmeta, dir.path(), false).unwrap().is_empty());
     }
 
     /// A partition of `size` bytes filled with 0xAA, so untouched bytes

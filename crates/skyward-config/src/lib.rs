@@ -17,6 +17,8 @@ pub mod ramdisk {
     pub const MONO_LICENSE: &str = "skyward/KirkMono-OFL.txt";
     /// The recovery service binary init starts.
     pub const RECOVERY: &str = "system/bin/recovery";
+    /// The skyward cli command link beside recovery.
+    pub const SKYWARD: &str = "system/bin/skyward";
     /// The first program of a system installed beside the installed one,
     /// which Skyward puts in that system's init_boot image: linked
     /// statically, since it runs before any system's libraries are there.
@@ -34,6 +36,7 @@ pub mod ramdisk {
     pub const TASK_PROFILES: &str = "system/etc/task_profiles.json";
     /// The init rules that set up file transfer's USB function.
     pub const MTP_RC: &str = "system/etc/init/skyward-mtp.rc";
+    pub const STOCK_RC: &str = "system/etc/init/skyward-stock.rc";
 
     /// Whether the running root is Skyward's recovery ramdisk.
     pub fn in_recovery() -> bool {
@@ -41,7 +44,7 @@ pub mod ramdisk {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct DeviceConfig {
     pub device: Device,
     #[serde(default)]
@@ -86,10 +89,20 @@ pub struct DeviceConfig {
     pub stock: Option<Stock>,
 }
 
+/// Compression format for repacking a stock recovery ramdisk when the
+/// stock format would overflow a constrained recovery partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RamdiskCompression {
+    Lz4,
+    Gzip,
+    Lzma,
+}
+
 /// The stock build a recovery is made on: the phone maker's full update
 /// package of it, whose recovery partition the recovery is built on top
 /// of, and that partition as it should come out of the package.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct Stock {
     /// The build's version, such as OS4.0.4.0.XPACNXM.
     pub version: String,
@@ -97,6 +110,29 @@ pub struct Stock {
     pub package: String,
     /// The recovery partition's SHA-256, in lowercase hex.
     pub recovery: String,
+    /// Optional ramdisk compression override for repacking the recovery image.
+    #[serde(default)]
+    pub ramdisk_compression: Option<RamdiskCompression>,
+    /// Stock ramdisk entries (relative paths or directory prefixes) unused
+    /// by Skyward that can be pruned before repacking.
+    #[serde(default)]
+    pub prune: Vec<String>,
+    /// USB device controller name (`sys.usb.controller`, e.g. `a600000.dwc3`)
+    /// to set at init and put in peripheral mode when the bootloader omits
+    /// `androidboot.usbcontroller`.
+    #[serde(default)]
+    pub usb_controller: Option<String>,
+    /// Target path symlinked at `/dev/block/bootdevice` (e.g. `/dev/block`)
+    /// when the bootloader omits `androidboot.bootdevice`.
+    #[serde(default)]
+    pub bootdevice: Option<String>,
+    /// Additional stock init service executable paths to mark `disabled` and
+    /// stop explicit `start` rules for beyond `[service]` / `[[service]]`.
+    #[serde(default)]
+    pub disable_services: Vec<String>,
+    /// Custom property overrides to inject into default.prop / prop.default.
+    #[serde(default)]
+    pub props: Vec<String>,
 }
 
 /// What brings the phone's WLAN up inside a recovery, which loads none of
@@ -256,7 +292,7 @@ pub struct Names {
     pub en: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Device {
     pub codename: String,
     #[serde(default)]
@@ -288,6 +324,10 @@ pub struct Display {
     /// sliding over another rounds its leading corners to it.
     #[serde(default)]
     pub corner_radius: u32,
+    /// What is written after the panel turns back on (and at startup),
+    /// each value to its file.
+    #[serde(default)]
+    pub writes: Vec<Write>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -566,11 +606,19 @@ impl DeviceConfig {
                 ensure!(path.is_absolute() && plain && path.file_name().is_some(), "[[owners]] paths: {file} is not an absolute path to a file");
             }
         }
+        for write in &cfg.display.writes {
+            ensure!(Path::new(&write.path).is_absolute(), "[display] writes: {} is not an absolute path", write.path);
+        }
         if let Some(stock) = &cfg.stock {
             let name = stock.package.rsplit('/').next().unwrap_or_default();
+            let valid_source = if name.ends_with(".zip") {
+                name.contains(&stock.version)
+            } else {
+                name.ends_with(".img") || name.ends_with(".img.gz")
+            };
             ensure!(
-                stock.package.starts_with("https://") && name.ends_with(".zip") && name.contains(&stock.version) && !stock.version.is_empty(),
-                "[stock] package: {} is not an HTTPS address of the full package of {}",
+                stock.package.starts_with("https://") && !stock.version.is_empty() && valid_source,
+                "[stock] package: {} is not an HTTPS address of the full package or recovery image of {}",
                 stock.package,
                 stock.version
             );
@@ -579,6 +627,32 @@ impl DeviceConfig {
                 "[stock] recovery: {} is not a SHA-256 in lowercase hex",
                 stock.recovery
             );
+            for path in &stock.prune {
+                let clean = Path::new(path);
+                let plain = clean.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+                ensure!(
+                    !path.is_empty() && !path.ends_with('/') && plain,
+                    "[stock] prune: {path} is not a relative ramdisk path"
+                );
+            }
+            if let Some(ctrl) = &stock.usb_controller {
+                ensure!(
+                    !ctrl.is_empty() && !ctrl.contains('/') && !ctrl.chars().any(char::is_whitespace),
+                    "[stock] usb_controller: {ctrl:?} is not a UDC controller name"
+                );
+            }
+            if let Some(dev) = &stock.bootdevice {
+                ensure!(
+                    dev.starts_with('/') && !dev.chars().any(char::is_whitespace),
+                    "[stock] bootdevice: {dev:?} is not an absolute device path"
+                );
+            }
+            for path in &stock.disable_services {
+                ensure!(
+                    path.starts_with('/') && !path.chars().any(char::is_whitespace),
+                    "[stock] disable_services: {path:?} is not an absolute binary path"
+                );
+            }
         }
         if let Some(wlan) = &cfg.wlan {
             ensure!(wlan.probe.starts_with("http://"), "[wlan] probe: {} is not a plain HTTP address", wlan.probe);
@@ -814,7 +888,26 @@ mod tests {
         assert!(DeviceConfig::parse(&format!("{plain}recovery = \"{hash}\"\n")).is_err(), "over plain HTTP");
         let other = ok.replace("version = \"OS1.0.1.0", "version = \"OS1.0.2.0");
         assert!(DeviceConfig::parse(&format!("{other}recovery = \"{hash}\"\n")).is_err(), "the package of another build");
+        let raw = format!("[device]\ncodename = \"x\"\n[stock]\nversion = \"V1\"\npackage = \"https://d.example/recovery.img.gz\"\nrecovery = \"{hash}\"\n");
+        assert!(DeviceConfig::parse(&raw).is_ok());
+        assert!(DeviceConfig::parse(&format!(
+            "{raw}ramdisk_compression = \"lzma\"\nprune = [\"res/ColorOS/ttf\"]\nusb_controller = \"a600000.dwc3\"\nbootdevice = \"/dev/block\"\ndisable_services = [\"/system/bin/gatekeeperd\"]\n"
+        ))
+        .is_ok());
+        assert!(DeviceConfig::parse(&format!("{raw}prune = [\"/res\"]\n")).is_err(), "absolute prune path");
+        assert!(DeviceConfig::parse(&format!("{raw}prune = [\"../etc\"]\n")).is_err(), "parent traversal in prune path");
+        assert!(DeviceConfig::parse(&format!("{raw}usb_controller = \"a/b\"\n")).is_err(), "usb controller with slash");
+        assert!(DeviceConfig::parse(&format!("{raw}bootdevice = \"dev/block\"\n")).is_err(), "relative bootdevice path");
+        assert!(DeviceConfig::parse(&format!("{raw}disable_services = [\"gatekeeperd\"]\n")).is_err(), "relative service path");
         assert_eq!(DeviceConfig::parse("[device]\ncodename = \"x\"\n").unwrap().stock, None);
+    }
+
+    #[test]
+    fn display_writes_require_absolute_paths() {
+        let ok = "[device]\ncodename = \"x\"\n[display]\nwrites = [{ path = \"/sys/kernel/oppo_display/notify_panel_blank\", value = \"1\" }]\n";
+        assert!(DeviceConfig::parse(ok).is_ok());
+        let bad = "[device]\ncodename = \"x\"\n[display]\nwrites = [{ path = \"sys/foo\", value = \"1\" }]\n";
+        assert!(DeviceConfig::parse(bad).is_err());
     }
 
     #[test]
@@ -947,5 +1040,42 @@ mod tests {
         assert!(!report.uses(Path::new("/vendor")));
         let nezha = DeviceConfig::parse(include_str!("../../../devices/nezha.toml")).unwrap();
         assert!(nezha.services[0].uses(Path::new("/vendor")), "its shell and its libraries are the vendor partition's");
+    }
+
+    #[test]
+    fn parses_pchm30() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/pchm30.toml")).unwrap();
+        assert_eq!(cfg.device.codename, "pchm30");
+        assert_eq!(cfg.device.brand, "OPPO");
+        assert_eq!(cfg.device.model, "OPPO A11x");
+        assert!(!cfg.device.ab);
+        assert_eq!(cfg.device.os_version_prop, "ro.build.display.id");
+        assert_eq!((cfg.display.width, cfg.display.height, cfg.display.density), (720, 1600, 320));
+        assert_eq!(cfg.display.writes.len(), 1);
+        assert_eq!(cfg.display.writes[0].path, "/sys/kernel/oppo_display/notify_panel_blank");
+        assert_eq!(cfg.firmware.as_ref().map(|f| f.partition.as_str()), Some("modem"));
+        assert_eq!(cfg.partitions.mounted, ["persist", "cache"]);
+        let paths: Vec<&str> = cfg.services.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/system/bin/qseecomd",
+                "/system/bin/hwservicemanager",
+                "/system/bin/android.hardware.keymaster@4.0-service-qti",
+                "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti",
+            ]
+        );
+        assert_eq!(cfg.services[0].libraries, ["/system/lib64", "/vendor/lib64"]);
+        assert_eq!(cfg.services[2].ready_hardware_service.as_deref(), Some("android.hardware.keymaster@4.0::IKeymasterDevice/default"));
+        assert_eq!(cfg.services[3].ready_hardware_service.as_deref(), Some("android.hardware.gatekeeper@1.0::IGatekeeper/default"));
+        assert_eq!(cfg.backup.efs, ["modemst1", "modemst2", "fsg", "fsc", "oppostanvbk", "oppodycnvbk", "persist"]);
+        let stock = cfg.stock.expect("pchm30 defines a stock image");
+        assert_eq!(stock.version, "PCHM30_11_F.12");
+        assert!(stock.package.ends_with(".img.gz"));
+        assert_eq!(stock.ramdisk_compression, Some(RamdiskCompression::Lzma));
+        assert_eq!(stock.prune, ["res/ColorOS/ttf", "res/realmeUI/ttf"]);
+        assert_eq!(stock.usb_controller.as_deref(), Some("4e00000.dwc3"));
+        assert_eq!(stock.bootdevice.as_deref(), Some("/dev/block/platform/soc/4804000.ufshc"));
+        assert!(stock.disable_services.iter().any(|s| s == "/system/bin/gatekeeperd"));
     }
 }

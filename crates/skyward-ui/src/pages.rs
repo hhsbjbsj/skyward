@@ -1048,10 +1048,19 @@ fn reflashed(c: &mut Canvas, cx: &Ctx, y: f32) -> f32 {
     match &cx.state.reflash {
         None => y,
         Some(Reflash::Written(written)) => {
-            let slots = fmt::slots(l, written);
-            let said = match (l, written.len()) {
-                (Lang::En, 1) => format!("Skyward went back into {slots}'s recovery partition."),
-                _ => tr!(l, "已将 Skyward 重新刷入{slots} 的 recovery 分区。", "已將 Skyward 重新刷入{slots} 的 recovery 分割區。", "Skyward went back into the recovery partitions of {slots}."),
+            let said = if written.is_empty() {
+                l.pick([
+                    "已将 Skyward 重新刷入 recovery 分区。",
+                    "已將 Skyward 重新刷入 recovery 分割區。",
+                    "Skyward went back into the recovery partition.",
+                ])
+                .into()
+            } else {
+                let slots = fmt::slots(l, written);
+                match (l, written.len()) {
+                    (Lang::En, 1) => format!("Skyward went back into {slots}'s recovery partition."),
+                    _ => tr!(l, "已将 Skyward 重新刷入{slots} 的 recovery 分区。", "已將 Skyward 重新刷入{slots} 的 recovery 分割區。", "Skyward went back into the recovery partitions of {slots}."),
+                }
             };
             widgets::footnote(c, t, f, y, &said)
         }
@@ -1221,14 +1230,19 @@ pub fn installing(cx: &Ctx) -> Frame {
             let parts = widgets::list(&mut c, t, f, y, &rows);
             let choose: Vec<Action> = (0..choice.partitions.len()).map(Action::FlashPartition).collect();
             out.extend(hits(&parts.rows, &choose));
-            let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["槽位", "槽位", "Slot"]));
-            let titles = Pick::ALL.map(|p| pick_title(l, p, i.slot));
-            let rows: Vec<Row> =
-                Pick::ALL.iter().zip(&titles).map(|(p, title)| Row::new(title).trail(Trail::Check(*p == choice.pick))).collect();
-            let picks = widgets::list(&mut c, t, f, y, &rows);
-            out.extend(hits(&picks.rows, &Pick::ALL.map(Action::FlashSlots)));
+            let bottom = if i.slot.is_some() {
+                let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["槽位", "槽位", "Slot"]));
+                let titles = Pick::ALL.map(|p| pick_title(l, p, i.slot));
+                let rows: Vec<Row> =
+                    Pick::ALL.iter().zip(&titles).map(|(p, title)| Row::new(title).trail(Trail::Check(*p == choice.pick))).collect();
+                let picks = widgets::list(&mut c, t, f, y, &rows);
+                out.extend(hits(&picks.rows, &Pick::ALL.map(Action::FlashSlots)));
+                picks.bottom
+            } else {
+                parts.bottom
+            };
             let (label, danger) = confirm_label(Confirm::Flash, cx.state);
-            let track = widgets::confirm(&mut c, t, f, picks.bottom + t.m.dp(28.0), label, danger, s.confirm);
+            let track = widgets::confirm(&mut c, t, f, bottom + t.m.dp(28.0), label, danger, s.confirm);
             out.push(Hit { rect: track, action: Action::Confirm(Confirm::Flash) });
             let note = l.pick(match s.source {
                 Source::Computer => [
@@ -1497,8 +1511,12 @@ fn finished(
             afterwards_of(c, cx, y, true)
         }
         Outcome::Flashed { partition, slots } => {
-            let slots = fmt::slots(l, slots);
-            let detail = tr!(l, "{partition} 已刷入{slots}。", "{partition} 已刷入{slots}。", "Flashed to {partition} in {slots}.");
+            let detail = if slots.is_empty() {
+                tr!(l, "已刷入 {partition} 分区。", "已刷入 {partition} 分割區。", "Flashed to {partition}.")
+            } else {
+                let slots = fmt::slots(l, slots);
+                tr!(l, "{partition} 已刷入{slots}。", "{partition} 已刷入{slots}。", "Flashed to {partition} in {slots}.")
+            };
             let y = widgets::list(c, t, f, top, &[standing(l.pick(["刷入成功", "刷入成功", "Flashed"]), GREEN, Icon::Install, &detail)]).bottom;
             let mut rows = vec![restart];
             let mut acts = vec![Action::RebootTo(Target::System)];
@@ -2816,15 +2834,24 @@ fn skyward_online(c: &mut Canvas, cx: &Ctx, y: f32, out: &mut Vec<Hit>) -> f32 {
             stop.bottom
         }
         Some(SkywardJob { outcome: Some(SkywardEnd::Updated(slots)), .. }) => {
-            let names = fmt::slots(l, slots);
-            let detail = match (l, slots.len()) {
-                (Lang::En, 1) => format!("Skyward {version} is in {names}'s recovery partition."),
-                _ => tr!(
+            let detail = if slots.is_empty() {
+                tr!(
                     l,
-                    "已将 Skyward {version} 刷入{names} 的 recovery 分区。",
-                    "已將 Skyward {version} 刷入{names} 的 recovery 分割區。",
-                    "Skyward {version} is in the recovery partitions of {names}."
-                ),
+                    "已将 Skyward {version} 刷入 recovery 分区。",
+                    "已將 Skyward {version} 刷入 recovery 分割區。",
+                    "Skyward {version} is in the recovery partition."
+                )
+            } else {
+                let names = fmt::slots(l, slots);
+                match (l, slots.len()) {
+                    (Lang::En, 1) => format!("Skyward {version} is in {names}'s recovery partition."),
+                    _ => tr!(
+                        l,
+                        "已将 Skyward {version} 刷入{names} 的 recovery 分区。",
+                        "已將 Skyward {version} 刷入{names} 的 recovery 分割區。",
+                        "Skyward {version} is in the recovery partitions of {names}."
+                    ),
+                }
             };
             let y = widgets::list(c, t, f, y + gap, &[standing(l.pick(["更新成功", "更新成功", "Updated"]), GREEN, Icon::Install, &detail)]).bottom;
             let restart = widgets::list(c, t, f, y + gap, &[Row::new(l.pick(["重启到恢复模式", "重新啟動到復原模式", "Reboot to recovery"])).icon(ORANGE, Icon::Power)]);
@@ -2841,18 +2868,27 @@ fn skyward_online(c: &mut Canvas, cx: &Ctx, y: f32, out: &mut Vec<Hit>) -> f32 {
                     y = widgets::footnote(c, t, f, y, why);
                 }
                 Some(SkywardEnd::WriteFailed(slots, why)) => {
-                    let names = fmt::slots(l, slots);
-                    let warning = match (l, slots.len()) {
-                        (Lang::En, 1) => format!(
-                            "{}'s recovery partition was only partly written, so rebooting to recovery may not start Skyward. Update again, and reboot once it's done.",
-                            capitalized(l, &names)
-                        ),
-                        _ => tr!(
-                            l,
-                            "{names} 的 recovery 分区仅写入了部分内容，重启到恢复模式可能无法进入 Skyward。请重新更新，完成后再重启。",
-                            "{names} 的 recovery 分割區僅寫入了部分內容，重新啟動到復原模式可能無法進入 Skyward。請重新更新，完成後再重新啟動。",
-                            "The recovery partitions of {names} were only partly written, so rebooting to recovery may not start Skyward. Update again, and reboot once it's done."
-                        ),
+                    let warning = if slots.is_empty() {
+                        l.pick([
+                            "recovery 分区仅写入了部分内容，重启到恢复模式可能无法进入 Skyward。请重新更新，完成后再重启。",
+                            "recovery 分割區僅寫入了部分內容，重新啟動到復原模式可能無法進入 Skyward。請重新更新，完成後再重新啟動。",
+                            "The recovery partition was only partly written, so rebooting to recovery may not start Skyward. Update again, and reboot once it's done.",
+                        ])
+                        .into()
+                    } else {
+                        let names = fmt::slots(l, slots);
+                        match (l, slots.len()) {
+                            (Lang::En, 1) => format!(
+                                "{}'s recovery partition was only partly written, so rebooting to recovery may not start Skyward. Update again, and reboot once it's done.",
+                                capitalized(l, &names)
+                            ),
+                            _ => tr!(
+                                l,
+                                "{names} 的 recovery 分区仅写入了部分内容，重启到恢复模式可能无法进入 Skyward。请重新更新，完成后再重启。",
+                                "{names} 的 recovery 分割區僅寫入了部分內容，重新啟動到復原模式可能無法進入 Skyward。請重新更新，完成後再重新啟動。",
+                                "The recovery partitions of {names} were only partly written, so rebooting to recovery may not start Skyward. Update again, and reboot once it's done."
+                            ),
+                        }
                     };
                     y = widgets::footnote(c, t, f, y, &warning);
                     y = widgets::footnote(c, t, f, y, why);

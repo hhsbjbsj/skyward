@@ -163,4 +163,19 @@ mod tests {
         app.key(Key::Back, 0);
         assert!(tap(&mut app, &f, &i, Action::Open(Screen::SkywardUpdate)).is_empty(), "an answer heard is not asked again");
     }
+
+    #[test]
+    fn a_phone_without_slots_formats_skyward_update_outcomes() {
+        let (f, i) = (fonts(), DeviceInfo { slot: None, ..info() });
+        let mut update = App::new(Screen::SkywardUpdate, W, H, PPD);
+        update.state.wlan = Some(connected("Skyward"));
+        update.state.recovery_partitions = true;
+        update.skyward_checked(Ok(skyward_newest(true)));
+        assert!(matches!(tap(&mut update, &f, &i, Action::UpdateSkyward).as_slice(), [Effect::UpdateSkyward(_)]));
+        update.skyward_ended(SkywardEnd::WriteFailed(vec![], "io".into()), 2000);
+        let _ = update.frame(&f, &i);
+        assert!(matches!(tap_at(&mut update, &f, &i, Action::UpdateSkyward, 4000).as_slice(), [Effect::UpdateSkyward(_)]));
+        update.skyward_ended(SkywardEnd::Updated(vec![]), 5000);
+        let _ = update.frame(&f, &i);
+    }
 }

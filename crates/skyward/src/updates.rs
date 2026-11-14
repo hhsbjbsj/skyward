@@ -328,15 +328,25 @@ fn fetch(
 
 /// Write the image in the zip at `path`, once it is Skyward for the phone
 /// `codename` names, into the recovery partitions of the slot that starts
-/// next and of any other slot that holds Skyward, telling how far that has
-/// come.
+/// next and of any other slot that holds Skyward (or the single static
+/// `recovery` partition on non-A/B phones), telling how far that has come.
 fn write(path: &Path, codename: &str, tell: &dyn Fn(Event)) -> End {
     let dir = Path::new(skyward_block::BY_NAME);
     let ready = || -> Result<(Vec<u8>, Vec<Slot>)> {
         let image = upgrade::unzip(path)?;
         upgrade::check(&image, codename)?;
-        let next = skyward_vab::boot::next_slot().context("ask which slot starts next")?;
-        Ok((image, upgrade::slots(dir, next)?))
+        let slots = match skyward_vab::current_slot()? {
+            Some(_) => {
+                let next = skyward_vab::boot::next_slot().context("ask which slot starts next")?;
+                upgrade::slots(dir, next)?
+            }
+            None => {
+                let recovery = dir.join("recovery");
+                ensure!(recovery.try_exists().with_context(|| format!("look for {}", recovery.display()))?, "the phone has no recovery partition");
+                Vec::new()
+            }
+        };
+        Ok((image, slots))
     };
     let (image, slots) = match ready() {
         Ok(ready) => ready,

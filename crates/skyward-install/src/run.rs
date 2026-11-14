@@ -599,7 +599,7 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
     Ok(match code? {
         0 => {
             if let Some(kept) = &kept {
-                reflash(ctx, kept, Ok(slot.other()));
+                reflash(ctx, kept, Ok(Some(slot.other())));
             }
             Done::Decided(Outcome::Installed { slot: slot.other(), wipe })
         }
@@ -610,7 +610,7 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
 /// This recovery, held before an install writes, when the screen asked to
 /// keep it in the recovery partitions; none when it was started without
 /// being flashed.
-fn hold(ctx: &Context, current: Slot) -> Result<Option<Kept>> {
+fn hold(ctx: &Context, current: Option<Slot>) -> Result<Option<Kept>> {
     if !ctx.options.keep {
         return Ok(None);
     }
@@ -624,10 +624,10 @@ fn hold(ctx: &Context, current: Slot) -> Result<Option<Kept>> {
 /// Write this recovery back into the recovery partitions the install wrote
 /// over and into that of `next`, the slot that starts next, telling the
 /// screen how far it is and then how it went.
-fn reflash(ctx: &Context, kept: &Kept, next: Result<Slot>) {
+fn reflash(ctx: &Context, kept: &Kept, next: Result<Option<Slot>>) {
     let slots = match next.and_then(|next| kept.wanted(next)) {
-        Ok(slots) if slots.is_empty() => return,
-        Ok(slots) => slots,
+        Ok(Some(slots)) => slots,
+        Ok(None) => return,
         Err(e) => return ctx.send(Event::Reflashed(Reflash::Failed(format!("{e:#}")))),
     };
     let mut told: Option<Instant> = None;
@@ -780,7 +780,8 @@ fn lines(from: impl Read, mut each: impl FnMut(&str) -> io::Result<()>) -> io::R
 
 fn flash_image(ctx: &Context, kind: ImageKind, size: u64) -> Result<Done> {
     let dir = Path::new(skyward_block::BY_NAME);
-    let partitions = image::partitions(kind, dir)?;
+    let ab = skyward_vab::current_slot()?.is_some();
+    let partitions = image::partitions_for(kind, dir, ab)?;
     if partitions.is_empty() {
         return Ok(Done::Decided(Outcome::Refused(Refusal::NoPartition)));
     }
@@ -791,11 +792,15 @@ fn flash_image(ctx: &Context, kind: ImageKind, size: u64) -> Result<Done> {
         Ok(other) => bail!("an image waiting for its partition was told {other:?}"),
     };
     ensure!(partitions.contains(&partition), "{partition} is not among {partitions:?}");
-    ensure!(!slots.is_empty(), "no slot chosen for {partition}");
+    ensure!(!ab || !slots.is_empty(), "no slot chosen for {partition}");
     if [skyward_systems::store::BOOT, skyward_systems::store::INIT_BOOT].contains(&partition) {
         installed_boot_set()?;
     }
-    let devices: Vec<_> = slots.iter().map(|&slot| image::device(dir, partition, slot)).collect();
+    let devices: Vec<_> = if ab {
+        slots.iter().map(|&slot| image::device(dir, partition, Some(slot))).collect()
+    } else {
+        vec![image::device(dir, partition, None)]
+    };
     let mut file = BufReader::with_capacity(1 << 20, File::open(fuse::PACKAGE).context("open the package")?);
     let mut told: Option<Instant> = None;
     image::flash(&mut file, size, &devices, &mut |done, total| {
@@ -839,7 +844,7 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
             Ok(other) => bail!("a script waiting to be agreed to was told {other:?}"),
         }
     }
-    let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+    let slot = skyward_vab::current_slot()?;
     extract_script()?;
     shell_at_sbin()?;
     let kept = hold(ctx, slot)?;
@@ -847,12 +852,16 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
     detach_once(ctx)?;
     // While an update is in flight, the slot's partitions in super are its
     // and stay unmapped.
-    let mapped = match skyward_vab::snapshot_state()? {
-        SnapshotState::None => skyward_vab::map_slot(slot)?,
-        state => {
-            let _ = kmsg(&format!("install: the slot's partitions stay unmapped while an update is in flight ({state:?})"));
-            SlotMaps::default()
+    let mapped = if slot.is_some() {
+        match skyward_vab::snapshot_state()? {
+            SnapshotState::None => skyward_vab::map_slot(slot)?,
+            state => {
+                let _ = kmsg(&format!("install: the slot's partitions stay unmapped while an update is in flight ({state:?})"));
+                SlotMaps::default()
+            }
         }
+    } else {
+        skyward_vab::map_slot(None)?
     };
     let mounted = skyward_block::mount::mount_ids()?;
     let ran = run_binary(ctx);
@@ -863,7 +872,8 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
     // the recovery of the slot that starts next, which a package that
     // installs to the other slot switches to.
     if let Some(kept) = &kept {
-        reflash(ctx, kept, skyward_vab::boot::next_slot().context("ask which slot starts next"));
+        let next = slot.map(|_| skyward_vab::boot::next_slot().context("ask which slot starts next")).transpose();
+        reflash(ctx, kept, next);
     }
     let (code, wipe_cache) = ran?;
     Ok(Done::Script { code, wipe_cache })
@@ -898,8 +908,24 @@ fn extract_script() -> Result<()> {
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("take away the {BINARY} an earlier install left")),
     }
+    let mut content = Vec::new();
+    script.read_to_end(&mut content).context("read the install script")?;
+    // AnyKernel3 includes a workaround for LineageOS Recovery (`echo "u:r:su:s0" > /proc/self/attr/current`)
+    // where LineageOS made `su` permissive. On stock-based recoveries, `recovery` is already
+    // permissive while `su` is enforcing and lacks permissions to run basic utilities or access pipes.
+    // Replace any transition to `su` so the installer stays in the permissive recovery domain.
+    let patched = if content.starts_with(b"#!") {
+        let text = String::from_utf8_lossy(&content);
+        if text.contains("u:r:su:s0") {
+            text.replace("u:r:su:s0", "u:r:recovery:s0").into_bytes()
+        } else {
+            content
+        }
+    } else {
+        content
+    };
     let mut out = OpenOptions::new().write(true).create_new(true).open(BINARY).with_context(|| format!("make {BINARY}"))?;
-    io::copy(&mut script, &mut out).with_context(|| format!("write {BINARY}"))?;
+    out.write_all(&patched).with_context(|| format!("write {BINARY}"))?;
     out.set_permissions(fs::Permissions::from_mode(0o755)).with_context(|| format!("make {BINARY} runnable"))
 }
 
@@ -907,13 +933,59 @@ fn extract_script() -> Result<()> {
 fn shell_at_sbin() -> Result<()> {
     let link = Path::new(SBIN_SHELL);
     match fs::symlink_metadata(link) {
-        Ok(_) => return Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            let dir = link.parent().expect("the link is in a folder");
+            fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
+            symlink(SHELL, link).with_context(|| format!("link {SBIN_SHELL} to {SHELL}"))?;
+        }
         Err(e) => return Err(e).with_context(|| format!("look at {SBIN_SHELL}")),
     }
-    let dir = link.parent().expect("the link is in a folder");
-    fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
-    symlink(SHELL, link).with_context(|| format!("link {SBIN_SHELL} to {SHELL}"))
+
+    // Ensure /default.prop is a regular file in rootfs so it won't disappear when AnyKernel3 binds /system
+    if let Ok(meta) = fs::symlink_metadata("/default.prop") {
+        if meta.file_type().is_symlink() {
+            if let Ok(content) = fs::read("/default.prop") {
+                let _ = fs::remove_file("/default.prop");
+                let _ = fs::write("/default.prop", content);
+            }
+        }
+    }
+
+    // Provide /sbin/getprop wrapper for AnyKernel3 and other recovery scripts
+    let dev = prop("ro.product.device").unwrap_or_default();
+    let getprop_script = format!(
+        r#"#!/sbin/sh
+if [ -z "$1" ]; then
+    cat /default.prop 2>/dev/null
+    exit 0
+fi
+case "$1" in
+    ro.product.device|ro.build.product|ro.product.vendor.device|ro.vendor.product.device)
+        echo "{dev}"
+        exit 0
+        ;;
+    ro.build.type)
+        echo "userdebug"
+        exit 0
+        ;;
+esac
+val=$(grep "^$1=" /default.prop 2>/dev/null | tail -n1 | cut -d= -f2-)
+if [ -n "$val" ]; then
+    echo "$val"
+    exit 0
+fi
+val=$(grep "^$1=" /vendor/build.prop 2>/dev/null | tail -n1 | cut -d= -f2-)
+if [ -n "$val" ]; then
+    echo "$val"
+    exit 0
+fi
+"#
+    );
+    let _ = fs::write("/sbin/getprop", getprop_script);
+    let _ = fs::set_permissions("/sbin/getprop", fs::Permissions::from_mode(0o755));
+
+    Ok(())
 }
 
 /// A line one of the install script's outputs gave.
@@ -940,6 +1012,15 @@ impl Drop for Group {
 /// whether it asked for the cache partition to be erased after. What it
 /// leaves running is ended with it.
 fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
+    if let Ok(mut f) = OpenOptions::new().append(true).open("/default.prop") {
+        if let Some(dev) = prop("ro.product.device") {
+            let _ = writeln!(f, "\nro.product.device={dev}");
+            let _ = writeln!(f, "ro.build.product={dev}");
+            let _ = writeln!(f, "ro.product.vendor.device={dev}");
+            let _ = writeln!(f, "ro.vendor.product.device={dev}");
+            let _ = writeln!(f, "ro.build.type=userdebug");
+        }
+    }
     let mut log = File::create(SCRIPT_LOG).with_context(|| format!("create {SCRIPT_LOG}"))?;
     let (requests_read, requests_write) = pipe()?;
     let (output_read, output_write) = pipe()?;

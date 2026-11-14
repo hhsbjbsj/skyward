@@ -313,7 +313,8 @@ fn no_update() -> Result<()> {
 }
 
 fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<PathBuf> {
-    let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+    let slot = skyward_vab::current_slot()?;
+    let suffix = slot.map_or("", Slot::suffix);
     let [boot, system, data, efs] = t.parts;
     if system {
         no_update()?;
@@ -326,9 +327,11 @@ fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<Pa
     if boot {
         // The boot partitions are backed up as the installed system's,
         // whose boot set goes back into them first.
-        skyward_systems::install::ensure_installed()?;
+        if slot.is_some() {
+            skyward_systems::install::ensure_installed()?;
+        }
         for name in BOOT {
-            let device = partition(&format!("{name}{}", slot.suffix()));
+            let device = partition(&format!("{name}{suffix}"));
             if device.exists() {
                 let size = skyward_block::size_bytes(&device)?;
                 plan.push((Part::Boot, name.to_string(), Source::Block(device), size));
@@ -383,7 +386,7 @@ fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<Pa
                     copy(&mut from, &mut writer, *size, cancel, &mut telling).with_context(|| format!("back up {name}"))?;
                 }
                 Source::Logical(base) => {
-                    let whole = skyward_vab::map_whole(slot, base, &format!("skyward-backup-{base}{}", slot.suffix()), true)?;
+                    let whole = skyward_vab::map_whole(slot, base, &format!("skyward-backup-{base}{suffix}"), true)?;
                     let copied = File::open(&whole.device)
                         .with_context(|| format!("open {}", whole.device.display()))
                         .and_then(|mut from| copy(&mut from, &mut writer, whole.size, cancel, &mut telling));
@@ -405,7 +408,7 @@ fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<Pa
         }
         let data_key = if data { Some(data_key()?) } else { None };
         let manifest =
-            Manifest { format: FORMAT, device: t.device.clone(), made: t.made, slot: slot.suffix().into(), system: t.system.clone(), data_key, items };
+            Manifest { format: FORMAT, device: t.device.clone(), made: t.made, slot: suffix.into(), system: t.system.clone(), data_key, items };
         manifest.write(&folder, t.ownership)?;
         unsafe { libc::sync() };
         Ok(())
@@ -464,7 +467,8 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
     if manifest.device != t.device {
         return Err(Refusal::OtherPhone(manifest.device).into());
     }
-    let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+    let slot = skyward_vab::current_slot()?;
+    let suffix = slot.map_or("", Slot::suffix);
     let mut items: Vec<&Item> = manifest.items.iter().filter(|i| t.parts[index(i.part)]).collect();
     ensure!(!items.is_empty(), "nothing chosen to restore is in the backup");
     items.sort_by_key(|i| RESTORE_ORDER.iter().position(|&p| p == i.part));
@@ -513,7 +517,7 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
     // The boot partitions are restored as the installed system's, whose
     // boot set goes back into them first, so that the second system's is
     // not left kept as being there.
-    if items.iter().any(|i| i.part == Part::Boot) {
+    if slot.is_some() && items.iter().any(|i| i.part == Part::Boot) {
         skyward_systems::install::ensure_installed()?;
     }
     // Once anything is written, the restore goes on to its end.
@@ -528,7 +532,7 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
             }
             Part::System => {
                 let mut telling = Telling::new(tell, k, item.stored.size * 2, false);
-                let whole = skyward_vab::map_whole(slot, &item.name, &format!("skyward-restore-{}{}", item.name, slot.suffix()), false)?;
+                let whole = skyward_vab::map_whole(slot, &item.name, &format!("skyward-restore-{}{suffix}", item.name), false)?;
                 let written = write_image(&whole.device, &t.folder, &item.stored, &mut telling);
                 skyward_vab::unmap_whole(&whole)?;
                 written?;
@@ -552,10 +556,10 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
 }
 
 /// The partition a part of a backup goes back to.
-fn target(item: &Item, slot: Slot) -> PathBuf {
-    match item.part {
-        Part::Efs => partition(&item.name),
-        _ => partition(&format!("{}{}", item.name, slot.suffix())),
+fn target(item: &Item, slot: Option<Slot>) -> PathBuf {
+    match (item.part, slot) {
+        (Part::Boot, Some(slot)) => partition(&format!("{}{}", item.name, slot.suffix())),
+        _ => partition(&item.name),
     }
 }
 

@@ -36,7 +36,7 @@ pub enum Task {
     /// update keys and made for this phone.
     Disable { package_size: u64 },
     /// Undo the sharing of blocks in the slot's ext4 partitions.
-    Unshare { slot: Slot },
+    Unshare { slot: Option<Slot> },
     /// Check the whole of a filesystem and fix what is wrong.
     Repair(Part),
     /// Make a partition's filesystem afresh as this one.
@@ -164,7 +164,7 @@ fn disable(package_size: u64, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
 /// runs this with none of the slot's partitions mounted, so where it
 /// carries no e2fsck of its own, the installed system's is copied out
 /// first.
-fn unshare(slot: Slot, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
+fn unshare(slot: Option<Slot>, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
     let bases = skyward_vab::slot_bases(slot).map_err(|e| Stop::Failed(said(&e)))?;
     tell(Event::Listed(bases.clone()));
     let mut held = Vec::new();
@@ -202,7 +202,7 @@ fn unshare(slot: Slot, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
 
 /// What the slot's partition `base` holds, looked at through a mapping of
 /// its own.
-fn filesystem_of(slot: Slot, base: &str) -> Result<Option<String>> {
+fn filesystem_of(slot: Option<Slot>, base: &str) -> Result<Option<String>> {
     let whole = skyward_vab::map_whole(slot, base, WORK_MAPPING, true)?;
     let held = probe::filesystem(&whole.device);
     skyward_vab::unmap_whole(&whole)?;
@@ -211,7 +211,7 @@ fn filesystem_of(slot: Slot, base: &str) -> Result<Option<String>> {
 
 /// e2fsck as it runs once the slot's partitions are let go: the recovery's
 /// own as it is, or the installed system's, copied out of it.
-fn e2fsck(slot: Slot) -> Result<tools::Tool, Stop> {
+fn e2fsck(slot: Option<Slot>) -> Result<tools::Tool, Stop> {
     match tools::find(fsck::E2FSCK) {
         Ok(own) if own.libraries.is_empty() => Ok(own),
         _ => copy_e2fsck(slot),
@@ -220,7 +220,7 @@ fn e2fsck(slot: Slot) -> Result<tools::Tool, Stop> {
 
 /// Copy e2fsck and its own libraries out of the installed system, mounted
 /// for the moment, to where they run from once the system is let go.
-fn copy_e2fsck(slot: Slot) -> Result<tools::Tool, Stop> {
+fn copy_e2fsck(slot: Option<Slot>) -> Result<tools::Tool, Stop> {
     let copied = (|| -> Result<Result<tools::Tool, Stop>> {
         skyward_vab::mount_one(slot, tools::SYSTEM)?;
         let found = tools::find(fsck::E2FSCK);

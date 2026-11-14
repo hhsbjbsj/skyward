@@ -156,7 +156,11 @@ pub fn collect_with(cfg: &DeviceConfig, battery: Option<Battery>) -> Result<Devi
     Ok(DeviceInfo {
         // The system names the exact edition; the configured model covers a
         // system whose partitions are not mounted.
-        model: system.get("ro.product.marketname").unwrap_or_else(|| cfg.device.model.clone()),
+        model: system
+            .get("ro.product.marketname")
+            .or_else(|| system.get("ro.oppo.market.name"))
+            .or_else(|| system.get("ro.vendor.oplus.market.name"))
+            .unwrap_or_else(|| cfg.device.model.clone()),
         codename: cfg.device.codename.clone(),
         soc: cfg.device.soc.clone(),
         cpu: cpu(Path::new(CPU))?,
@@ -197,10 +201,7 @@ impl SystemProps {
         if !skyward_config::ramdisk::in_recovery() {
             return Ok(SystemProps::Running);
         }
-        let read = match skyward_vab::current_slot()? {
-            Some(slot) => installed_props(slot),
-            None => Ok(HashMap::new()),
-        };
+        let read = installed_props(skyward_vab::current_slot()?);
         let why = read.as_ref().err().map(|e| format!("{e:#}"));
         if PROPS_UNREAD.lock().expect("nothing panics while it is held").untold(why.as_deref()) {
             skyward_sys::kmsg(&format!("the installed system's properties could not be read, and the phone's details go without them: {}", why.unwrap_or_default()))?;
@@ -229,18 +230,27 @@ const BOOT_PROPS: &str = "ro.boot.";
 /// passes before it reads any of these, and a file may import another named
 /// after them, as Xiaomi's odm imports what each hardware version sets; so
 /// they come first here too, the same in a recovery as in the system.
-pub fn installed_props(slot: Slot) -> Result<HashMap<String, String>> {
+pub fn installed_props(slot: Option<Slot>) -> Result<HashMap<String, String>> {
     let base = |m: &skyward_vab::Mounted| -> String {
-        m.partition.strip_suffix(slot.suffix()).expect("mounted partitions carry the slot suffix").to_string()
+        match slot {
+            Some(s) => m.partition.strip_suffix(s.suffix()).expect("mounted partitions carry the slot suffix").to_string(),
+            None => m.partition.clone(),
+        }
     };
     let mut parts = skyward_vab::mounted_partitions(slot)?;
     parts.sort_by_key(|m| PROP_ORDER.iter().position(|b| *b == base(m)).unwrap_or(PROP_ORDER.len()));
     let mut props: HashMap<String, String> = skyward_sys::props(BOOT_PROPS).into_iter().collect();
     for m in &parts {
         let files: &[&str] = match base(m).as_str() {
-            "system" => &["system/build.prop"],
+            "system" => &[
+                "system/build.prop",
+                "system/system_ext/etc/build.prop",
+                "system/system_ext/build.prop",
+                "system/product/etc/build.prop",
+                "system/product/build.prop",
+            ],
             "vendor" => &["default.prop", "build.prop"],
-            _ => &["etc/build.prop"],
+            _ => &["etc/build.prop", "build.prop"],
         };
         for f in files {
             let path = m.mount_point.join(f);
@@ -253,7 +263,23 @@ pub fn installed_props(slot: Slot) -> Result<HashMap<String, String>> {
                 .with_context(|| format!("read {}", path.display()))?;
         }
     }
+    let runtime = Path::new("/cache/runtime.prop");
+    if runtime.try_exists().unwrap_or(false) {
+        merge_fallback_props(runtime, &mut props)?;
+    }
     Ok(props)
+}
+
+/// Merge fallback properties from `path` into `props` without overwriting
+/// values already collected from mounted system/vendor partitions.
+fn merge_fallback_props(path: &Path, props: &mut HashMap<String, String>) -> Result<()> {
+    let mut extra = HashMap::new();
+    rsproperties::load_properties_from_file(path, None, "u:r:init:s0", &mut extra)
+        .with_context(|| format!("read {}", path.display()))?;
+    for (k, v) in extra {
+        props.entry(k).or_insert(v);
+    }
+    Ok(())
 }
 
 fn read(path: impl AsRef<Path>) -> Result<String> {
@@ -514,5 +540,16 @@ mod tests {
         assert!(!said_online(Err(Error::from(ErrorKind::WouldBlock))).unwrap(), "Qualcomm's USB-C connector early in a boot");
         assert!(!said_online(Err(Error::from(ErrorKind::NotFound))).unwrap(), "a supply without the file");
         assert!(said_online(Err(Error::from(ErrorKind::PermissionDenied))).is_err(), "anything else is an error");
+    }
+
+    #[test]
+    fn cache_runtime_props_never_overwrite_partition_props() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime.prop");
+        fs::write(&runtime, "ro.build.version.release=11\nro.oppo.version=CN\n").unwrap();
+        let mut props = HashMap::from([("ro.build.version.release".into(), "16".into())]);
+        merge_fallback_props(&runtime, &mut props).unwrap();
+        assert_eq!(props.get("ro.build.version.release").map(String::as_str), Some("16"));
+        assert_eq!(props.get("ro.oppo.version").map(String::as_str), Some("CN"));
     }
 }

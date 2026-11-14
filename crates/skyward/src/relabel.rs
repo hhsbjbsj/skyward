@@ -39,23 +39,32 @@ impl std::fmt::Display for Unmounted {
 impl std::error::Error for Unmounted {}
 
 /// The installed system's rules for labeling files, from each partition of
-/// `slot` that keeps some: every one of those partitions the slot has must
-/// be mounted, and the system's own are always there.
-pub fn rule_files(slot: Slot) -> Result<Vec<PathBuf>> {
+/// `slot` (or static partitions when `slot` is `None`) that keeps some:
+/// every one of those partitions the phone has must be mounted, and the
+/// system's own are always there.
+pub fn rule_files(slot: Option<Slot>) -> Result<Vec<PathBuf>> {
     let bases = skyward_vab::slot_bases(slot)?;
     let mounted: Vec<PathBuf> = skyward_vab::mounted_partitions(slot)?.into_iter().map(|m| m.mount_point).collect();
+    let embedded = [
+        ("system_ext", "system/system_ext/etc/selinux/system_ext_file_contexts"),
+        ("product", "system/product/etc/selinux/product_file_contexts"),
+    ];
     let mut found = Vec::new();
     for (base, file) in RULES {
-        if !bases.iter().any(|b| b == base) {
-            continue;
-        }
-        let point = skyward_vab::mount_point(base);
-        if !mounted.contains(&point) {
-            return Err(Unmounted(base.into()).into());
-        }
-        let path = point.join(file);
-        if path.exists() {
-            found.push(path);
+        if bases.iter().any(|b| b == base) {
+            let point = skyward_vab::mount_point(base);
+            if !mounted.contains(&point) {
+                return Err(Unmounted(base.into()).into());
+            }
+            let path = point.join(file);
+            if path.exists() {
+                found.push(path);
+            }
+        } else if let Some((_, sub)) = embedded.iter().find(|(name, _)| *name == base) {
+            let path = skyward_vab::mount_point("system").join(sub);
+            if path.exists() {
+                found.push(path);
+            }
         }
     }
     let system = skyward_vab::mount_point("system").join(RULES[0].1);

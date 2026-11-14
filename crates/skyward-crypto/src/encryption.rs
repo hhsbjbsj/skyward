@@ -26,16 +26,38 @@ pub struct Encryption {
 }
 
 impl Encryption {
-    /// Read what an entry of the phone's own table says.
-    pub fn of(entry: &Entry) -> Result<Encryption> {
-        let said = entry.extra("metadata_encryption").context("the phone says its data partition is not encrypted whole")?;
-        let (name, rest) = said.split_once(':').unwrap_or((said, ""));
-        let cipher = CIPHERS
-            .iter()
-            .find_map(|(theirs, kernels)| (*theirs == name).then_some(*kernels))
-            .with_context(|| format!("no cipher here is the {name} the phone names"))?;
-        Ok(Encryption { cipher: cipher.to_string(), wrapped: rest == "wrappedkey_v0" })
+    /// Read what an entry of the phone's own table says, or `None` when the
+    /// phone does not use whole-partition metadata encryption.
+    pub fn of(entry: &Entry) -> Result<Option<Encryption>> {
+        if let Some(said) = entry.extra("metadata_encryption") {
+            return Ok(Some(parse_metadata(said)?));
+        }
+        // Naming the key directory turns metadata encryption on. With no
+        // cipher written beside it, the default is AES-256-XTS. The files'
+        // own flag says whether that key is hardware-wrapped.
+        if entry.extra("keydirectory").is_some() {
+            let wrapped = entry.extra("fileencryption").is_some_and(crate::fscrypt::hardware_wrapped);
+            return Ok(Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped }));
+        }
+        Ok(None)
     }
+}
+
+/// The cipher and wrapped-key flag in a `metadata_encryption` value.
+/// `wrappedkey_v0` and `:wrappedkey_v0` name no cipher. AES-256-XTS is the
+/// default, and the key is one only the storage hardware unwraps. ColorOS
+/// on SM6125 writes the first of those.
+fn parse_metadata(said: &str) -> Result<Encryption> {
+    let (name, rest) = said.split_once(':').unwrap_or((said, ""));
+    if matches!((name, rest), ("wrappedkey_v0", "") | ("", "wrappedkey_v0")) {
+        return Ok(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true });
+    }
+    let shown = if name.is_empty() { said } else { name };
+    let cipher = CIPHERS
+        .iter()
+        .find_map(|(theirs, kernels)| (*theirs == name).then_some(*kernels))
+        .with_context(|| format!("no cipher here is the {shown} the phone names"))?;
+    Ok(Encryption { cipher: cipher.to_string(), wrapped: rest == "wrappedkey_v0" })
 }
 
 /// Where the phone keeps the key for the filesystem an entry describes.
@@ -73,14 +95,16 @@ mod tests {
     #[test]
     fn the_phones_own_words_for_the_cipher_become_the_kernels() {
         let e = entry("metadata_encryption=aes-256-xts:wrappedkey_v0,keydirectory=/metadata/vold/metadata_encryption");
-        assert_eq!(Encryption::of(&e).unwrap(), Encryption { cipher: "aes-xts-plain64".into(), wrapped: true });
+        assert_eq!(Encryption::of(&e).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true }));
         let plain = entry("metadata_encryption=adiantum");
-        assert_eq!(Encryption::of(&plain).unwrap(), Encryption { cipher: "xchacha12,aes-adiantum-plain64".into(), wrapped: false });
+        assert_eq!(Encryption::of(&plain).unwrap(), Some(Encryption { cipher: "xchacha12,aes-adiantum-plain64".into(), wrapped: false }));
+        let coloros = entry("metadata_encryption=wrappedkey_v0,keydirectory=/metadata/vold/metadata_encryption");
+        assert_eq!(Encryption::of(&coloros).unwrap(), Some(Encryption { cipher: "aes-xts-plain64".into(), wrapped: true }));
     }
 
     #[test]
     fn a_cipher_or_a_key_the_phone_does_not_name_is_an_error() {
-        assert!(Encryption::of(&entry("quota")).is_err());
+        assert_eq!(Encryption::of(&entry("quota")).unwrap(), None);
         assert!(Encryption::of(&entry("metadata_encryption=rot13")).is_err());
         assert!(key_dir(&entry("quota")).is_err());
     }

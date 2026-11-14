@@ -275,7 +275,7 @@ fn main() -> Result<()> {
         }
         Cmd::Identify { file } => identify(&file),
         Cmd::Mount => {
-            let mounts = skyward_vab::mount_partitions(booted_slot()?)?;
+            let mounts = skyward_vab::mount_partitions(skyward_vab::current_slot()?)?;
             for d in &mounts.damaged {
                 println!("damaged: {d}");
             }
@@ -284,10 +284,10 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Umount => skyward_vab::unmount_partitions(booted_slot()?),
+        Cmd::Umount => skyward_vab::unmount_partitions(skyward_vab::current_slot()?),
         #[cfg(target_os = "android")]
         Cmd::Services { config } => {
-            let slot = booted_slot()?;
+            let slot = skyward_vab::current_slot()?;
             let props = skyward_info::installed_props(slot)?;
             let services: Vec<Started> = DeviceConfig::load(&config)?.services.into_iter().filter(|s| s.runs_on(&props)).map(Started::from).collect();
             let libraries = secure::libraries()?;
@@ -299,7 +299,7 @@ fn main() -> Result<()> {
         }
         #[cfg(target_os = "android")]
         Cmd::Keys => {
-            for line in keys::describe(&keys::found(booted_slot()?, secure::libraries()?.as_deref())?.steps?) {
+            for line in keys::describe(&keys::found(skyward_vab::current_slot()?, secure::libraries()?.as_deref())?.steps?) {
                 println!("{line}");
             }
             Ok(())
@@ -347,11 +347,17 @@ fn main() -> Result<()> {
         #[cfg(target_os = "android")]
         Cmd::Keymint { key, alias } => {
             let binder = skyward_binder::driver::Binder::open()?;
-            let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
+            let hardware = skyward_binder::driver::Binder::hardware().ok();
+            let service = skyward_crypto::KeyService::open(&binder, hardware.as_ref())?;
             let hw = service.hardware()?;
-            println!("keymint {} version {} at security level {} by {}", hw.name, hw.version, hw.security_level, hw.author);
+            println!("key service {} version {} at security level {} by {}", hw.name, hw.version, hw.security_level, hw.author);
             if let Some(alias) = alias {
-                let held = skyward_crypto::keystore2::key_blob(Path::new(skyward_crypto::keystore2::DATABASE), &alias)?;
+                let sqlite = Path::new(skyward_crypto::keystore2::DATABASE);
+                let held = if sqlite.exists() {
+                    skyward_crypto::keystore2::key_blob(sqlite, &alias)?
+                } else {
+                    skyward_crypto::keystore1::key_blob(Path::new(skyward_crypto::keystore1::USER_0), &alias)?
+                };
                 println!("{alias} is a key of {} bytes", held.len());
                 for (tag, value) in service.authorizations(&held, &[])? {
                     println!("  tag {tag} = {value} ({value:#x})");
@@ -407,7 +413,8 @@ fn main() -> Result<()> {
         Cmd::Data { credential, close: false } => {
             use skyward_crypto::data;
             let binder = skyward_binder::driver::Binder::open()?;
-            let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
+            let hardware = skyward_binder::driver::Binder::hardware().ok();
+            let service = skyward_crypto::KeyService::open(&binder, hardware.as_ref())?;
             let opening = data::open_without_credential(&service)?;
             match &opening.mounted {
                 Some(mounted) => {
@@ -443,7 +450,7 @@ fn main() -> Result<()> {
             // keys are read from the partitions again, as it read them;
             // where they do not show, it started none.
             let mut programs = cfg.services.clone();
-            match booted_slot().and_then(|slot| keys::found(slot, secure::libraries()?.as_deref())?.steps) {
+            match skyward_vab::current_slot().and_then(|slot| keys::found(slot, secure::libraries()?.as_deref())?.steps) {
                 Ok(steps) => programs.extend(keys::programs(&steps)),
                 Err(e) => eprintln!("the programs of the phone's keys are not known: {e:#}"),
             }
@@ -518,7 +525,7 @@ fn load_modules(cfg: &DeviceConfig, names: &[String]) -> Result<Vec<PathBuf>> {
 /// among the phone's partitions: where what the partitions say could not
 /// be made out, the phone's devices are up before that is said.
 #[cfg(target_os = "android")]
-fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Found>) -> Result<()> {
+fn bring_up(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>, found: Result<keys::Found>) -> Result<()> {
     let nodes = skyward_sys::ueventd::apply()?;
     skyward_sys::kmsg(&format!("{nodes} device nodes given the owner their phone describes"))?;
     let props = skyward_info::installed_props(slot)?;
@@ -534,7 +541,7 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     // The drivers ask for their firmware by name, and the kernel looks only
     // in folders of its own unless told to pass on what it does not find
     // there to ueventd, which looks in the recovery's firmware folders.
-    std::fs::write(FIRMWARE_FALLBACK, "1").with_context(|| format!("write 1 to {FIRMWARE_FALLBACK}"))?;
+    let _ = std::fs::write(FIRMWARE_FALLBACK, "1");
     if let Some(firmware) = &cfg.firmware {
         mount_firmware(&firmware.partition)?;
     }
@@ -562,7 +569,10 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     let programs = || services.iter().map(|p| &p.service).chain(&key_programs);
     let hardware: Vec<String> = programs().filter_map(|s| s.ready_hardware_service.clone()).collect();
     if !hardware.is_empty() {
-        secure::prepare_hardware_directory(&hardware)?;
+        let directory_from_system = !services
+            .iter()
+            .any(|s| s.service.ready_property.as_deref() == Some("hwservicemanager.ready") && !s.service.path.starts_with("/mnt/"));
+        secure::prepare_hardware_directory(&hardware, directory_from_system)?;
         skyward_sys::kmsg("the directory for the phone's hardware services can run")?;
     }
     // A program that registers with the service directory needs the
@@ -741,12 +751,13 @@ fn recovery() -> Result<()> {
         std::fs::set_permissions(skyward_sys::RUN, std::fs::Permissions::from_mode(0o755))
             .with_context(|| format!("open {} to the recovery's other users", skyward_sys::RUN))?;
         skyward_sys::keep_log(Path::new(skyward_sys::LOG))?;
-        // A recovery that ended with a function of its own in the port took
-        // the port with it; going through "none" takes that function off.
-        if skyward_sys::prop("sys.usb.state").is_some_and(|s| s != "adb") {
-            skyward_sys::usb::set("none", std::time::Duration::from_secs(5))?;
+        // Ensure the USB port transitions cleanly to adb through none
+        // so init's property triggers rebind the controller.
+        if skyward_sys::prop("sys.usb.state").as_deref() != Some("adb") {
+            if let Err(e) = skyward_sys::usb::switch("adb", std::time::Duration::from_secs(5)) {
+                skyward_sys::kmsg(&format!("the USB port did not go to adb: {e:#}"))?;
+            }
         }
-        skyward_sys::set_prop("sys.usb.config", "adb")?;
         let misc = bcb::misc();
         let message = bcb::read(&misc)?;
         let request = message.request();
@@ -754,6 +765,9 @@ fn recovery() -> Result<()> {
             bcb::clear(&misc)?;
         }
         let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+        if let Some(controller) = &cfg.stock.usb_controller {
+            let _ = skyward_sys::set_prop("ro.boot.usbcontroller", controller);
+        }
         skyward_sys::kmsg(&format!(
             "{} {} recovery up, misc command {:?} args {:?}, asking for {:?}",
             cfg.device.codename,
@@ -808,7 +822,7 @@ fn recovery() -> Result<()> {
             // shared blocks, which writes to the slot's own.
             let mut programs = cfg.services.clone();
             if !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
-                programs.extend(prepare(&cfg, booted_slot()?)?);
+                programs.extend(prepare(&cfg, skyward_vab::current_slot()?)?);
             }
             let root = Path::new("/");
             ui::run(&cfg, &programs, &root.join(ramdisk::FONT), &root.join(ramdisk::MONO), request, Screen::Home, None)
@@ -829,7 +843,8 @@ fn recovery() -> Result<()> {
 /// stay usable when super cannot be mounted, as after it is wiped, so the
 /// reason goes to the kernel log instead.
 #[cfg(target_os = "android")]
-fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<Vec<skyward_config::Service>> {
+fn prepare(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>) -> Result<Vec<skyward_config::Service>> {
+    let _ = skyward_block::ensure_by_name();
     match skyward_vab::mount_partitions(slot) {
         Ok(mounts) => {
             for d in &mounts.damaged {

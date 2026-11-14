@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn an_image_goes_where_it_is_sent_once_swiped() {
-        let (f, i) = (fonts(), info());
+        let (f, i) = (fonts(), DeviceInfo { slot: Some(Slot::A), ..info() });
         let mut app = sideloading(&f, &i);
         app.install(Event::Checking { size: 201_326_592 }, 0);
         let kind = ImageKind::Boot { kernel: true, ramdisk: skyward_install::Ramdisk::Recovery };
@@ -365,6 +365,27 @@ mod tests {
         app.key(Key::Back, 2000);
         assert_eq!(app.screen(), Screen::Install);
         assert_eq!(app.state.install, Install::Idle);
+    }
+
+    #[test]
+    fn a_phone_without_slots_hides_slot_choice_and_formats_single_partition_outcomes() {
+        let (f, i) = (fonts(), DeviceInfo { slot: None, ..info() });
+        let mut app = sideloading(&f, &i);
+        app.state.wlan = Some(connected("Skyward"));
+        app.state.recovery_partitions = true;
+        app.install(Event::Checking { size: 67_108_864 }, 0);
+        let kind = ImageKind::Boot { kernel: true, ramdisk: skyward_install::Ramdisk::Recovery };
+        app.install(Event::Image { kind, size: 67_108_864, partitions: vec!["recovery"] }, 0);
+        let frame = app.frame(&f, &i);
+        assert!(!frame.hits.iter().any(|h| matches!(h.action, Action::FlashSlots(_))), "slot picker stays hidden");
+        let track = frame.hits.iter().find(|h| h.action == Action::Confirm(Confirm::Flash)).unwrap().rect;
+        let y = track.centre().1 - app.top().1;
+        app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
+        app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
+        assert!(matches!(app.touch(Touch::Up, &f, 1000).as_slice(), [Effect::Flash { partition: "recovery", .. }]));
+        app.install(Event::Reflashed(Reflash::Written(vec![])), 1000);
+        app.install(Event::Finished(Outcome::Flashed { partition: "recovery", slots: vec![] }), 1000);
+        let _ = app.frame(&f, &i);
     }
 
     #[test]

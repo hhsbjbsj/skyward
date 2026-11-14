@@ -9,7 +9,17 @@ use std::path::{Path, PathBuf};
 mod avb;
 mod described;
 
-use skyward_bootimg::{BootImage, Ramdisk};
+use skyward_bootimg::{BootImage, Compression, Ramdisk};
+
+impl From<skyward_config::RamdiskCompression> for Compression {
+    fn from(c: skyward_config::RamdiskCompression) -> Self {
+        match c {
+            skyward_config::RamdiskCompression::Lz4 => Compression::Lz4,
+            skyward_config::RamdiskCompression::Gzip => Compression::Gzip,
+            skyward_config::RamdiskCompression::Lzma => Compression::Lzma,
+        }
+    }
+}
 
 /// Builds Skyward recovery images from a device's own stock images.
 #[derive(Parser)]
@@ -117,7 +127,8 @@ fn main() -> Result<()> {
         }
         Cmd::Repack { image, out } => {
             let mut img = BootImage::read(&image)?;
-            img.ramdisk = Ramdisk::decode(&img.ramdisk)?.encode()?;
+            let compression = Compression::of(&img.ramdisk);
+            img.ramdisk = Ramdisk::decode(&img.ramdisk)?.encode_as(compression)?;
             write(&out, &img, &img.to_bytes()?)
         }
         Cmd::Boot { kernel, ramdisk, out } => {
@@ -135,7 +146,10 @@ fn main() -> Result<()> {
                 anyhow::bail!("{} holds {}, which is not a stock recovery", stock.display(), e.name);
             }
             let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
-            skyward_config::DeviceConfig::load(&config)?;
+            let cfg = skyward_config::DeviceConfig::load(&config)?;
+            for prefix in cfg.stock.iter().flat_map(|s| &s.prune) {
+                rd.remove_prefix(prefix);
+            }
             rd.replace(paths::RECOVERY, read(&binary)?)?;
             // Install scripts look for the commands a stock recovery lacks
             // among its programs, and its unzip there too, a link to ziptool
@@ -144,6 +158,7 @@ fn main() -> Result<()> {
             for command in paths::COMMANDS {
                 rd.link(command, recovery)?;
             }
+            rd.link(paths::SKYWARD, recovery)?;
             rd.add(paths::SYSTEM_INIT, 0o755, read(&system_init)?)?;
             rd.add(paths::CONFIG, 0o644, read(&config)?)?;
             rd.add(paths::FONT, 0o644, read(&font)?)?;
@@ -155,20 +170,19 @@ fn main() -> Result<()> {
                 rd.add(paths::TASK_PROFILES, 0o644, TASK_PROFILES.to_vec())?;
             }
             rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
-            // On an unlocked device adbd keeps root when ro.secure is 0 and
-            // lets any computer in without authorization when ro.adb.secure is
-            // 0; init lets a later line of a property file override an earlier
-            // one. update_engine refuses a package built before the recovery
-            // itself unless both of the last two are set; the recovery checks
-            // packages against the installed system instead.
-            let stock_props = &rd
-                .find(paths::PROP_DEFAULT)
-                .with_context(|| format!("{} is not in the ramdisk", paths::PROP_DEFAULT))?
-                .data;
-            let mut props = without(stock_props, &BUILD_VERSION);
-            props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
-            rd.replace(paths::PROP_DEFAULT, props)?;
-            img.ramdisk = rd.encode()?;
+            let stock = cfg.stock.as_ref();
+            if let Some(stock_rc) = render_stock_rc(
+                stock.and_then(|s| s.usb_controller.as_deref()),
+                stock.and_then(|s| s.bootdevice.as_deref()),
+            ) {
+                rd.add(paths::STOCK_RC, 0o644, stock_rc.into_bytes())?;
+            }
+            patch_props(&mut rd, &cfg)?;
+            disable_init_services(&mut rd, &cfg.services, stock.map_or(&[][..], |s| s.disable_services.as_slice()))?;
+            let compression = stock
+                .and_then(|s| s.ramdisk_compression.map(Compression::from))
+                .unwrap_or_else(|| Compression::of(&img.ramdisk));
+            img.ramdisk = rd.encode_as(compression)?;
             let bytes = img.to_bytes()?;
             write(&out, &img, &avb::footed(&bytes, "recovery", size, &Sha256::digest(&bytes))?)
         }
@@ -199,6 +213,37 @@ fn take_stock_recovery(stock: &skyward_config::Stock, out: &Path) -> Result<()> 
     std::fs::create_dir_all(parent).with_context(|| format!("make {}", parent.display()))?;
     // Taken out beside where it goes, so it is moved there whole.
     let work = tempfile::Builder::new().prefix(".stock").tempdir_in(parent).with_context(|| format!("make a folder in {}", parent.display()))?;
+    if !stock.package.ends_with(".zip") {
+        let dest = work.path().join("recovery.img");
+        let agent = ureq::Agent::new_with_defaults();
+        let mut resp = agent.get(&stock.package).call().with_context(|| format!("download {}", stock.package))?;
+        ensure!(resp.status().is_success(), "{} answered {}", stock.package, resp.status());
+        let raw_reader = resp.body_mut().with_config().limit(u64::MAX).reader();
+        let mut reader: Box<dyn Read> = if stock.package.ends_with(".gz") {
+            Box::new(flate2::read::GzDecoder::new(raw_reader))
+        } else {
+            Box::new(raw_reader)
+        };
+        let mut file = File::create(&dest).with_context(|| format!("create {}", dest.display()))?;
+        let mut hash = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = reader.read(&mut buf).with_context(|| format!("read {}", stock.package))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n]).with_context(|| format!("write {}", dest.display()))?;
+            hash.update(&buf[..n]);
+            total += n as u64;
+        }
+        file.sync_all().with_context(|| format!("flush {}", dest.display()))?;
+        let sum = hex::encode(hash.finalize());
+        ensure!(sum == stock.recovery, "the image at {} has SHA-256 {sum}, where the configuration names {}", stock.package, stock.recovery);
+        std::fs::rename(&dest, out).with_context(|| format!("move {} to {}", dest.display(), out.display()))?;
+        println!("wrote {} ({total} bytes), its SHA-256 the one the configuration names", out.display());
+        return Ok(());
+    }
     let payload = unpayload::Payload::open_url(&stock.package).with_context(|| format!("open {}", stock.package))?;
     let options = unpayload::ExtractOptions { output_dir: work.path().to_path_buf(), partitions: vec![RECOVERY.into()], ..Default::default() };
     let report = |event: unpayload::Event<'_>| match event {
@@ -255,6 +300,212 @@ const TASK_PROFILES: &[u8] = include_bytes!("task_profiles.json");
 /// stock recovery does not offer.
 const MTP_RC: &[u8] = include_bytes!("mtp.rc");
 
+/// On an unlocked device adbd keeps root when ro.secure is 0 and lets any
+/// computer in without authorization when ro.adb.secure is 0; init lets a
+/// later line of a property file override an earlier one. Some devices (such as
+/// OPPO) symlink `prop.default` to a partition not mounted in early init and
+/// place overrides in `system/etc/prop.default` and/or `secure.prop`, so patch
+/// whichever property files init loads.
+fn patch_props(rd: &mut Ramdisk, cfg: &skyward_config::DeviceConfig) -> Result<()> {
+    const SYSTEM_PROP_DEFAULT: &str = "system/etc/prop.default";
+    const SECURE_PROP: &str = "secure.prop";
+    const RECOVERY_OVERRIDES: &[u8] = b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n";
+    const SECURE_OVERRIDES: [&str; 3] = ["ro.secure", "ro.adb.secure", "ro.debuggable"];
+
+    ensure!(
+        rd.find(paths::PROP_DEFAULT).is_some() || rd.find("default.prop").is_some(),
+        "{} is not in the ramdisk",
+        paths::PROP_DEFAULT
+    );
+    let prop_regular = rd.find(paths::PROP_DEFAULT).is_some_and(skyward_bootimg::Entry::is_regular);
+    let target = if prop_regular { paths::PROP_DEFAULT } else { SYSTEM_PROP_DEFAULT };
+    let existing = rd.find(target).filter(|e| e.is_regular()).map(|e| e.data.as_slice()).unwrap_or_default();
+    let mut removed: Vec<&str> = BUILD_VERSION.to_vec();
+    let usb_controller = cfg.stock.as_ref().and_then(|s| s.usb_controller.as_deref());
+    if usb_controller.is_some() {
+        removed.push("sys.usb.controller");
+    }
+    let mut props = without(existing, &removed);
+    props.extend_from_slice(RECOVERY_OVERRIDES);
+    if let Some(ctrl) = usb_controller {
+        props.extend_from_slice(format!("sys.usb.controller={ctrl}\n").as_bytes());
+    }
+    let codename = &cfg.device.codename;
+    let codename_upper = codename.to_uppercase();
+    let model = &cfg.device.model;
+    let brand = &cfg.device.brand;
+    props.extend_from_slice(format!(
+        "\nro.product.device={codename_upper}\nro.build.product={codename_upper}\nro.product.model={model}\nro.product.brand={brand}\nro.product.name={codename}\nro.build.type=userdebug\n"
+    ).as_bytes());
+    if let Some(stock) = &cfg.stock {
+        for prop in &stock.props {
+            props.extend_from_slice(prop.as_bytes());
+            props.push(b'\n');
+        }
+    }
+    rd.replace_or_add(target, 0o644, props.clone())?;
+
+    if let Some(sec) = rd.find(SECURE_PROP).filter(|e| e.is_regular()) {
+        let mut patched = without(&sec.data, &SECURE_OVERRIDES);
+        patched.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\n");
+        rd.replace(SECURE_PROP, patched)?;
+    }
+    rd.replace_or_add("default.prop", 0o644, props)?;
+    Ok(())
+}
+
+/// Emit init rules for stock bootloaders that omit `androidboot.usbcontroller`
+/// or `androidboot.bootdevice` on the kernel command line.
+fn render_stock_rc(usb_controller: Option<&str>, bootdevice: Option<&str>) -> Option<String> {
+    if usb_controller.is_none() && bootdevice.is_none() {
+        return None;
+    }
+    let mut rc = String::from("# Hardware fallbacks injected by skyward-pack\n");
+    if let Some(ctrl) = usb_controller {
+        rc.push_str(&format!(
+            "\non early-init\n    setprop ro.boot.usbcontroller {ctrl}\n    setprop sys.usb.controller {ctrl}\n\non init\n    setprop sys.usb.controller {ctrl}\n    write /sys/class/udc/{ctrl}/device/../mode peripheral\n\non fs\n    write /sys/class/udc/{ctrl}/device/../mode peripheral\n\non boot\n    setprop sys.usb.controller {ctrl}\n    write /sys/class/udc/{ctrl}/device/../mode peripheral\n"
+        ));
+    }
+    if let Some(target) = bootdevice {
+        let name = target.rsplit('/').next().unwrap_or(target);
+        rc.push_str(&format!(
+            "\non early-init\n    setprop ro.boot.bootdevice {name}\n\non init\n    symlink {target} /dev/block/bootdevice\n    symlink {target}/by-name /dev/block/by-name\n\non fs\n    symlink {target} /dev/block/bootdevice\n    symlink {target}/by-name /dev/block/by-name\n\non post-fs\n    symlink {target} /dev/block/bootdevice\n    symlink {target}/by-name /dev/block/by-name\n"
+        ));
+    }
+    Some(rc)
+}
+
+/// Mark init `.rc` services `disabled` when Skyward starts the same program
+/// itself, so init does not launch an early ramdisk instance before partitions
+/// and properties are prepared.
+fn disable_init_services(rd: &mut Ramdisk, services: &[skyward_config::Service], extra: &[String]) -> Result<()> {
+    let managed: std::collections::BTreeSet<&str> = services.iter().map(|s| s.path.as_str()).chain(extra.iter().map(String::as_str)).collect();
+    if managed.is_empty() {
+        return Ok(());
+    }
+    let targets: Vec<String> = rd
+        .entries
+        .iter()
+        .filter(|e| e.is_regular() && e.name.ends_with(".rc"))
+        .map(|e| e.name.clone())
+        .collect();
+    let mut disabled_names = std::collections::BTreeSet::new();
+    for name in &targets {
+        let Some(entry) = rd.find(name).filter(|e| e.is_regular()) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&entry.data);
+        if let Some(patched) = disable_managed_rc(&text, &managed, &mut disabled_names) {
+            rd.replace(name, patched.into_bytes())?;
+        }
+    }
+    if !disabled_names.is_empty() {
+        for name in &targets {
+            let Some(entry) = rd.find(name).filter(|e| e.is_regular()) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&entry.data);
+            if let Some(patched) = suppress_start_commands(&text, &disabled_names) {
+                rd.replace(name, patched.into_bytes())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite `.rc` service blocks whose binary is in `managed` to include
+/// `disabled` when not already marked, recording each matched service's
+/// name in `disabled_names`, and returning `None` if nothing changed.
+fn disable_managed_rc(
+    text: &str,
+    managed: &std::collections::BTreeSet<&str>,
+    disabled_names: &mut std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let trailing_newline = text.ends_with('\n');
+    let mut out: Vec<String> = Vec::new();
+    let mut insert_at: Option<usize> = None;
+    let mut header_cont = false;
+    let mut has_disabled = false;
+    let mut changed = false;
+
+    let flush = |out: &mut Vec<String>, insert_at: &mut Option<usize>, has_disabled: &mut bool, changed: &mut bool| {
+        if let Some(idx) = insert_at.take().filter(|_| !*has_disabled) {
+            out.insert(idx, "    disabled".to_string());
+            *changed = true;
+        }
+        *has_disabled = false;
+    };
+
+    for raw_line in text.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let trimmed = line.trim();
+        if insert_at.is_some() && header_cont {
+            out.push(line.to_string());
+            header_cont = line.trim_end().ends_with('\\');
+            insert_at = Some(out.len());
+            continue;
+        }
+        let is_section = trimmed.starts_with("service ") || trimmed.starts_with("on ") || trimmed.starts_with("import ");
+        if insert_at.is_some() && is_section {
+            flush(&mut out, &mut insert_at, &mut has_disabled, &mut changed);
+        }
+        if trimmed.starts_with("service ") {
+            let mut words = trimmed["service ".len()..].split_whitespace();
+            let name = words.next().unwrap_or_default();
+            let binary = words.next().unwrap_or_default();
+            if managed.contains(binary) {
+                disabled_names.insert(name.to_string());
+                header_cont = line.trim_end().ends_with('\\');
+                insert_at = Some(out.len() + 1);
+                has_disabled = false;
+            }
+        } else if insert_at.is_some() && (trimmed == "disabled" || trimmed.starts_with("disabled ")) {
+            has_disabled = true;
+        }
+        out.push(line.to_string());
+    }
+    flush(&mut out, &mut insert_at, &mut has_disabled, &mut changed);
+    if !changed {
+        return None;
+    }
+    let mut joined = out.join("\n");
+    if trailing_newline {
+        joined.push('\n');
+    }
+    Some(joined)
+}
+
+/// Comment out explicit `start <service>` lines inside triggers for services
+/// that were disabled by Skyward.
+fn suppress_start_commands(text: &str, disabled_names: &std::collections::BTreeSet<String>) -> Option<String> {
+    let trailing_newline = text.ends_with('\n');
+    let mut out: Vec<String> = Vec::new();
+    let mut changed = false;
+    for raw_line in text.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let trimmed = line.trim();
+        let matches = trimmed
+            .strip_prefix("start ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .is_some_and(|name| disabled_names.contains(name));
+        if matches {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            out.push(format!("{indent}# disabled by skyward: {trimmed}"));
+            changed = true;
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !changed {
+        return None;
+    }
+    let mut joined = out.join("\n");
+    if trailing_newline {
+        joined.push('\n');
+    }
+    Some(joined)
+}
+
 /// A property file without the lines that set any of `names`.
 fn without(props: &[u8], names: &[&str]) -> Vec<u8> {
     let mut out = Vec::with_capacity(props.len());
@@ -288,7 +539,7 @@ fn list(image: &Path) -> Result<()> {
         h.header_version(),
         img.kernel.len(),
         img.ramdisk.len(),
-        h.osversionpatch
+        h.osversionpatch()
     );
     if img.ramdisk.is_empty() {
         return Ok(());
@@ -375,5 +626,80 @@ ro.vendor.build.security_patch=2026-10-01\nro.vendor.build.security_patch_level=
         assert_eq!(out, b"a=1\n");
         let kept = without(b"a=1\nb=2", &BUILD_VERSION);
         assert_eq!(kept, b"a=1\nb=2");
+    }
+
+    #[test]
+    fn patch_props_handles_symlinked_prop_default_and_secure_prop() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.link("prop.default", "/cache/runtime.prop").unwrap();
+        rd.link("default.prop", "system/etc/prop.default").unwrap();
+        rd.add("secure.prop", 0o644, b"ro.debuggable=0\nro.adb.secure=1\nro.secure=1\n".to_vec()).unwrap();
+        let cfg = skyward_config::DeviceConfig {
+            device: skyward_config::Device {
+                codename: "ishtar".into(),
+                brand: "Xiaomi".into(),
+                model: "Xiaomi 13 Ultra".into(),
+                ..Default::default()
+            },
+            stock: Some(skyward_config::Stock {
+                usb_controller: Some("a600000.dwc3".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        patch_props(&mut rd, &cfg).unwrap();
+        let etc = String::from_utf8(rd.find("system/etc/prop.default").unwrap().data.clone()).unwrap();
+        assert!(etc.contains("ro.debuggable=1") && etc.contains("ro.adb.secure=0") && etc.contains("ro.secure=0"));
+        assert!(etc.contains("sys.usb.controller=a600000.dwc3"));
+        let sec = String::from_utf8(rd.find("secure.prop").unwrap().data.clone()).unwrap();
+        assert!(!sec.contains("ro.debuggable=0") && sec.contains("ro.debuggable=1") && sec.contains("ro.secure=0"));
+    }
+
+    #[test]
+    fn disables_managed_init_services_in_rc() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        let rc = "\
+on fs
+    start hal_cryptoeng_oppo
+
+service hwservicemanager /system/bin/hwservicemanager
+    onrestart setprop hwservicemanager.ready false
+    seclabel u:r:recovery:s0
+
+service vendor.gatekeeper-1-0 /vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti \\
+    --lazy
+    seclabel u:r:recovery:s0
+
+service hal_cryptoeng_oppo /system/bin/hw/vendor.oplus.hardware.cryptoeng@1.0-service
+    class late_start
+    seclabel u:r:recovery:s0
+
+service qseecomd /system/bin/qseecomd
+    disabled
+    seclabel u:r:recovery:s0
+
+service keepme /system/bin/servicemanager
+    seclabel u:r:recovery:s0
+";
+        rd.add("system/etc/init/hw/init.rc", 0o644, rc.as_bytes().to_vec()).unwrap();
+        let cfg = skyward_config::DeviceConfig::parse(include_str!("../../../devices/pchm30.toml")).unwrap();
+        disable_init_services(&mut rd, &cfg.services, cfg.stock.as_ref().map_or(&[][..], |s| s.disable_services.as_slice())).unwrap();
+        let patched = String::from_utf8(rd.find("system/etc/init/hw/init.rc").unwrap().data.clone()).unwrap();
+        assert!(patched.contains("    # disabled by skyward: start hal_cryptoeng_oppo"));
+        assert!(patched.contains("service hwservicemanager /system/bin/hwservicemanager\n    disabled\n    onrestart"));
+        assert!(patched.contains("--lazy\n    disabled\n    seclabel u:r:recovery:s0"));
+        assert_eq!(patched.matches("    disabled\n").count(), 4);
+        assert!(!patched.contains("/system/bin/servicemanager\n    disabled"));
+    }
+
+    #[test]
+    fn renders_stock_rc_only_when_configured() {
+        assert!(render_stock_rc(None, None).is_none());
+        let rc = render_stock_rc(Some("a600000.dwc3"), Some("/dev/block")).unwrap();
+        assert!(rc.contains("setprop ro.boot.usbcontroller a600000.dwc3"));
+        assert!(rc.contains("setprop sys.usb.controller a600000.dwc3"));
+        assert!(rc.contains("write /sys/class/udc/a600000.dwc3/device/../mode peripheral"));
+        assert!(rc.contains("symlink /dev/block /dev/block/bootdevice"));
+        assert!(rc.contains("symlink /dev/block/by-name /dev/block/by-name"));
     }
 }
