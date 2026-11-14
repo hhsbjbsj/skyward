@@ -69,8 +69,41 @@ pub struct Partition {
     pub path: PathBuf,
 }
 
+/// Ensure `/dev/block/by-name` exists: if missing, link from `/dev/block/bootdevice/by-name`
+/// or search `/dev/block/platform/soc/*/by-name`.
+pub fn ensure_by_name() -> Result<()> {
+    let by_name = Path::new(BY_NAME);
+    if by_name.exists() {
+        return Ok(());
+    }
+    let bootdevice = Path::new("/dev/block/bootdevice");
+    let bootdevice_by_name = bootdevice.join("by-name");
+    if bootdevice_by_name.exists() {
+        #[cfg(target_os = "android")]
+        let _ = std::os::unix::fs::symlink(&bootdevice_by_name, by_name);
+        return Ok(());
+    }
+    if let Ok(entries) = std::fs::read_dir("/dev/block/platform/soc") {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("by-name");
+            if candidate.exists() {
+                #[cfg(target_os = "android")]
+                {
+                    if !bootdevice.exists() {
+                        let _ = std::os::unix::fs::symlink(entry.path(), bootdevice);
+                    }
+                    let _ = std::os::unix::fs::symlink(&candidate, by_name);
+                }
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Enumerate the `by-name` partition links, resolving each to its block device.
 pub fn list_by_name(dir: impl AsRef<Path>) -> Result<Vec<Partition>> {
+    let _ = ensure_by_name();
     let dir = dir.as_ref();
     let mut out = Vec::new();
     for ent in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {

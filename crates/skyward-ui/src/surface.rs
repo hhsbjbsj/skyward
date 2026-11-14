@@ -916,7 +916,7 @@ pub mod kms {
             let mut req = atomic::AtomicModeReq::new();
             for p in &self.planes {
                 req.add_property(p.handle, p.fb_prop, property::Value::Framebuffer(Some(buf.fb)));
-                if self.power == Power::Off {
+                if self.power != Power::On {
                     req.add_property(p.handle, p.crtc_prop, property::Value::CRTC(Some(self.crtc)));
                     req.add_property(p.handle, p.src_x.0, property::Value::UnsignedRange(p.src_x.1));
                     req.add_property(p.handle, p.src_y.0, property::Value::UnsignedRange(p.src_y.1));

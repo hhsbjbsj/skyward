@@ -110,6 +110,7 @@ fn ensure_no_snapshot() -> Result<()> {
 const STATIC_PARTITIONS: [&str; 5] = ["system", "vendor", "odm", "product", "system_ext"];
 
 fn static_bases() -> Result<Vec<String>> {
+    let _ = skyward_block::ensure_by_name();
     let mut found = Vec::new();
     for name in STATIC_PARTITIONS {
         let path = Path::new(BY_NAME).join(name);
@@ -362,6 +363,7 @@ pub fn unmap_slot(maps: &SlotMaps) -> Result<()> {
 /// where it was only unmounted.
 pub fn mount_one(slot: Option<Slot>, base_name: &str) -> Result<Mounted> {
     let Some(slot) = slot else {
+        let _ = skyward_block::ensure_by_name();
         let device = Path::new(BY_NAME).join(base_name);
         ensure!(device.try_exists().with_context(|| format!("look for {}", device.display()))?, "{} does not exist", device.display());
         let mount_point = mount_point(base_name);

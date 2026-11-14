@@ -721,13 +721,12 @@ fn recovery() -> Result<()> {
         // the port with it; going through "none" takes that function off.
         // The screen still comes up when the port does not answer in time,
         // so a failure goes to the kernel log.
-        if skyward_sys::prop("sys.usb.state").is_some_and(|s| s != "adb") {
-            if let Err(e) = skyward_sys::usb::set("none", std::time::Duration::from_secs(5)) {
-                skyward_sys::kmsg(&format!("the USB port did not go to none: {e:#}"))?;
+        // Ensure the USB port transitions cleanly to adb through none
+        // so init's property triggers rebind the controller.
+        if skyward_sys::prop("sys.usb.state").as_deref() != Some("adb") {
+            if let Err(e) = skyward_sys::usb::switch("adb", std::time::Duration::from_secs(5)) {
+                skyward_sys::kmsg(&format!("the USB port did not go to adb: {e:#}"))?;
             }
-        }
-        if let Err(e) = skyward_sys::set_prop("sys.usb.config", "adb") {
-            skyward_sys::kmsg(&format!("adb was not asked for: {e:#}"))?;
         }
         let misc = bcb::misc();
         let message = bcb::read(&misc)?;
@@ -808,6 +807,7 @@ fn recovery() -> Result<()> {
 /// after it is wiped, so the reason goes to the kernel log instead.
 #[cfg(target_os = "android")]
 fn prepare(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>) -> Result<()> {
+    let _ = skyward_block::ensure_by_name();
     match skyward_vab::mount_partitions(slot) {
         Ok(mounts) => {
             for d in &mounts.damaged {

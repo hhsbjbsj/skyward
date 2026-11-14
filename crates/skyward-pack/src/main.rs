@@ -317,13 +317,13 @@ fn render_stock_rc(usb_controller: Option<&str>, bootdevice: Option<&str>) -> Op
     let mut rc = String::from("# Hardware fallbacks injected by skyward-pack\n");
     if let Some(ctrl) = usb_controller {
         rc.push_str(&format!(
-            "\non early-init\n    setprop sys.usb.controller {ctrl}\n\non init\n    setprop sys.usb.controller {ctrl}\n    write /sys/class/udc/{ctrl}/device/../mode peripheral\n\non fs\n    write /sys/class/udc/{ctrl}/device/../mode peripheral\n\non boot\n    setprop sys.usb.controller {ctrl}\n    write /sys/class/udc/{ctrl}/device/../mode peripheral\n"
+            "\non early-init\n    setprop ro.boot.usbcontroller {ctrl}\n    setprop sys.usb.controller {ctrl}\n\non init\n    setprop sys.usb.controller {ctrl}\n    write /sys/class/udc/{ctrl}/device/../mode peripheral\n\non fs\n    write /sys/class/udc/{ctrl}/device/../mode peripheral\n\non boot\n    setprop sys.usb.controller {ctrl}\n    write /sys/class/udc/{ctrl}/device/../mode peripheral\n"
         ));
     }
     if let Some(target) = bootdevice {
         let name = target.rsplit('/').next().unwrap_or(target);
         rc.push_str(&format!(
-            "\non early-init\n    setprop ro.boot.bootdevice {name}\n\non post-fs\n    symlink {target} /dev/block/bootdevice\n"
+            "\non early-init\n    setprop ro.boot.bootdevice {name}\n\non init\n    symlink {target} /dev/block/bootdevice\n    symlink {target}/by-name /dev/block/by-name\n\non fs\n    symlink {target} /dev/block/bootdevice\n    symlink {target}/by-name /dev/block/by-name\n\non post-fs\n    symlink {target} /dev/block/bootdevice\n    symlink {target}/by-name /dev/block/by-name\n"
         ));
     }
     Some(rc)
@@ -641,8 +641,10 @@ service keepme /system/bin/servicemanager
     fn renders_stock_rc_only_when_configured() {
         assert!(render_stock_rc(None, None).is_none());
         let rc = render_stock_rc(Some("a600000.dwc3"), Some("/dev/block")).unwrap();
+        assert!(rc.contains("setprop ro.boot.usbcontroller a600000.dwc3"));
         assert!(rc.contains("setprop sys.usb.controller a600000.dwc3"));
         assert!(rc.contains("write /sys/class/udc/a600000.dwc3/device/../mode peripheral"));
         assert!(rc.contains("symlink /dev/block /dev/block/bootdevice"));
+        assert!(rc.contains("symlink /dev/block/by-name /dev/block/by-name"));
     }
 }
